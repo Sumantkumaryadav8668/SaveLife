@@ -1,0 +1,1016 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { useAuth } from '../../hooks/useAuth.js';
+import { sosAPI, authAPI } from '../../models/api.js';
+import { useSocket } from '../../hooks/useSocket.js';
+import { AlertTriangle, Users, Shield, Clock, MapPin, CheckCircle, UploadCloud, Plus, Trash2, ShieldAlert, EyeOff, Navigation, RefreshCw } from 'lucide-react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import { formatDate } from '../../lib/utils.js';
+import { queueLocation } from '../../utils/offlineQueue.js';
+
+// Fix Leaflet default marker icon paths in bundler build
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
+  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+});
+
+const DEFAULT_COORDS = [12.9716, 77.5946];
+
+const CitizenDashboard = () => {
+  const { user, refreshUser } = useAuth();
+  const socket = useSocket();
+
+  // Location telemetry states
+  const [currentLocation, setCurrentLocation] = useState(null);
+  const [fetchingLocation, setFetchingLocation] = useState(false);
+  const [locationError, setLocationError] = useState('');
+  const [currentArea, setCurrentArea] = useState('');
+
+  // Welcome location notification states
+  const [welcomeToast, setWelcomeToast] = useState(null);
+  const welcomeShownRef = useRef(false);
+
+  useEffect(() => {
+    if (currentArea && !welcomeShownRef.current) {
+      setWelcomeToast({
+        title: `Welcome back, ${user?.name || 'User'}!`,
+        message: `Current location: ${currentArea}`,
+        coords: currentLocation 
+          ? `Coords: ${currentLocation[0].toFixed(5)}°, ${currentLocation[1].toFixed(5)}°` 
+          : ''
+      });
+      welcomeShownRef.current = true;
+      const timer = setTimeout(() => {
+        setWelcomeToast(null);
+      }, 7000);
+      return () => clearTimeout(timer);
+    }
+  }, [currentArea, currentLocation, user?.name]);
+
+  const fetchAreaName = async (lat, lng) => {
+    try {
+      const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`);
+      if (response.ok) {
+        const data = await response.json();
+        const addr = data.address || {};
+        
+        // Find locality based on user's priority order:
+        // - suburb
+        // - neighbourhood
+        // - city_district
+        // - village
+        // - town
+        // - city
+        let locality = '';
+        if (addr.suburb) locality = addr.suburb;
+        else if (addr.neighbourhood) locality = addr.neighbourhood;
+        else if (addr.city_district) locality = addr.city_district;
+        else if (addr.village) locality = addr.village;
+        else if (addr.town) locality = addr.town;
+        else if (addr.city) locality = addr.city;
+
+        // Find the city part (to avoid duplicating locality)
+        const city = addr.city || addr.town || addr.county || addr.state || 'Bengaluru';
+
+        let area = '';
+        if (locality && city && locality.toLowerCase() !== city.toLowerCase()) {
+          area = `${locality}, ${city}`;
+        } else {
+          area = locality || city;
+        }
+
+        setCurrentArea(area);
+      }
+    } catch (err) {
+      console.error('Error reverse geocoding:', err);
+    }
+  };
+
+  // SOS state
+  const [activeCase, setActiveCase] = useState(null);
+  const [loadingSOS, setLoadingSOS] = useState(false);
+  const [silentSOS, setSilentSOS] = useState(false);
+
+  // SOS countdown states
+  const [sosCountdown, setSosCountdown] = useState(null);
+  const sosIntervalRef = useRef(null);
+
+  // Clear countdown interval on unmount
+  useEffect(() => {
+    return () => {
+      if (sosIntervalRef.current) {
+        clearInterval(sosIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // History state
+  const [history, setHistory] = useState([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Profile verifications & Contacts states
+  const [uploadingId, setUploadingId] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const [contactForm, setContactForm] = useState({ name: '', relation: '', phone: '' });
+  const [updatingContacts, setUpdatingContacts] = useState(false);
+
+  // Map state
+  const mapContainerRef = useRef(null);
+  const mapRef = useRef(null);
+  const citizenMarkerRef = useRef(null);
+  const responderMarkerRef = useRef(null);
+
+  const currentLocationRef = useRef(currentLocation);
+  useEffect(() => {
+    currentLocationRef.current = currentLocation;
+  }, [currentLocation]);
+
+  useEffect(() => {
+    fetchActiveCase();
+    fetchHistory();
+  }, []);
+
+  // Live location tracking and socket synchronization
+  useEffect(() => {
+    if (!navigator.geolocation) {
+      fetchIPLocation('Geolocation is not supported by this browser.');
+      return;
+    }
+
+    setFetchingLocation(true);
+    let watchId;
+
+    const startWatch = (highAccuracy = true) => {
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          setCurrentLocation([lat, lng]);
+          fetchAreaName(lat, lng);
+          setFetchingLocation(false);
+          setLocationError('');
+
+          // Emit real-time tracking update if there's an active distress case
+          if (activeCase && socket) {
+            socket.emit('update_location', {
+              userId: user.id,
+              latitude: lat,
+              longitude: lng
+            });
+          }
+
+          // If offline, queue the coordinate for later sync
+          if (!navigator.onLine) {
+            queueLocation(lat, lng);
+          }
+        },
+        (err) => {
+          console.error(`HTML5 Geolocation watch error (HighAccuracy=${highAccuracy}):`, err);
+          
+          if (highAccuracy && (err.code === err.POSITION_UNAVAILABLE || err.code === err.TIMEOUT)) {
+            // High accuracy failed or timed out — switch to low accuracy
+            console.log('High accuracy GPS unavailable. Switching to low accuracy...');
+            navigator.geolocation.clearWatch(watchId);
+            startWatch(false);
+            return;
+          }
+
+          let reason = 'Failed to fetch location.';
+          if (err.code === err.PERMISSION_DENIED) {
+            reason = 'Location access is required to display your current location.';
+          } else if (err.code === err.POSITION_UNAVAILABLE) {
+            reason = 'Position unavailable.';
+          } else if (err.code === err.TIMEOUT) {
+            reason = 'Request timed out.';
+          }
+          
+          // If we don't have a location yet, try IP fallback
+          if (!currentLocationRef.current) {
+            fetchIPLocation(reason);
+          } else {
+            setLocationError(reason);
+            setFetchingLocation(false);
+          }
+        },
+        { enableHighAccuracy: highAccuracy, timeout: highAccuracy ? 8000 : 5000, maximumAge: 0 }
+      );
+    };
+
+    startWatch(true);
+
+    return () => {
+      if (watchId) navigator.geolocation.clearWatch(watchId);
+    };
+  }, [activeCase, socket, user.id]);
+
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleSOSUpdate = (data) => {
+      if (activeCase && data.caseId === activeCase._id) {
+        fetchActiveCase();
+      }
+    };
+
+    const handleSOSResolved = (data) => {
+      if (activeCase && data.caseId === activeCase._id) {
+        setActiveCase(null);
+        fetchHistory();
+      }
+    };
+
+    const handleTrackingUpdate = (data) => {
+      if (activeCase && data.caseId === activeCase._id && data.responderLocation) {
+        updateMapResponderLocation(data.responderLocation);
+      }
+    };
+
+    socket.on('sos_status_update', handleSOSUpdate);
+    socket.on('sos_resolved', handleSOSResolved);
+    socket.on('tracking_update', handleTrackingUpdate);
+
+    return () => {
+      socket.off('sos_status_update', handleSOSUpdate);
+      socket.off('sos_resolved', handleSOSResolved);
+      socket.off('tracking_update', handleTrackingUpdate);
+    };
+  }, [socket, activeCase]);
+
+  // Handle map rendering for both safe (current location) and active distress tracking
+  useEffect(() => {
+    // If we have an active distress case, center on it. Otherwise center on tracked location
+    const coordinates = activeCase?.location?.coordinates || (currentLocation ? [currentLocation[1], currentLocation[0]] : null);
+    const latLng = coordinates ? [coordinates[1], coordinates[0]] : DEFAULT_COORDS;
+
+    if (!mapRef.current && mapContainerRef.current) {
+      mapRef.current = L.map(mapContainerRef.current).setView(latLng, 14);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(mapRef.current);
+
+      citizenMarkerRef.current = L.marker(latLng, {
+        icon: L.divIcon({
+          className: 'custom-div-icon',
+          html: activeCase 
+            ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
+            : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+          iconSize: [40, 40],
+          iconAnchor: [20, 20],
+        })
+      }).addTo(mapRef.current).bindPopup(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>').openPopup();
+    } else if (mapRef.current) {
+      mapRef.current.setView(latLng);
+      if (citizenMarkerRef.current) {
+        citizenMarkerRef.current.setLatLng(latLng);
+        citizenMarkerRef.current.setPopupContent(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>');
+        
+        // Re-inject icon HTML depending on active/inactive states
+        citizenMarkerRef.current.setIcon(L.divIcon({
+          className: 'custom-div-icon',
+          html: activeCase 
+            ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
+            : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+          iconSize: [40, 40],
+          iconAnchor: [20, 20],
+        }));
+      }
+    }
+
+    // Handle responder tracking marker updates
+    if (activeCase && activeCase.status === 'accepted' && activeCase.assignedResponder) {
+      const respLoc = activeCase.assignedResponder.location?.coordinates;
+      if (respLoc) {
+        const respLatLng = [respLoc[1], respLoc[0]];
+        if (!responderMarkerRef.current) {
+          responderMarkerRef.current = L.marker(respLatLng, {
+            icon: L.divIcon({
+              className: 'custom-div-icon',
+              html: `<div style="background: rgba(37, 99, 235, 0.2); border: 2px solid #2563EB; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #2563EB; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+              iconSize: [40, 40],
+              iconAnchor: [20, 20],
+            })
+          }).addTo(mapRef.current).bindPopup(`<b>Assigned Responder: ${activeCase.assignedResponder.name || 'Help Unit'}</b>`);
+        } else {
+          responderMarkerRef.current.setLatLng(respLatLng);
+        }
+
+        const group = new L.featureGroup([citizenMarkerRef.current, responderMarkerRef.current]);
+        mapRef.current.fitBounds(group.getBounds().pad(0.2));
+      }
+    } else {
+      if (responderMarkerRef.current) {
+        responderMarkerRef.current.remove();
+        responderMarkerRef.current = null;
+      }
+    }
+  }, [activeCase, currentLocation]);
+
+  const fetchIPLocation = async (reason) => {
+    try {
+      console.log(`Attempting IP-based geolocation fallback due to: ${reason}`);
+      const response = await fetch('https://ipapi.co/json/');
+      if (response.ok) {
+        const data = await response.json();
+        if (data.latitude && data.longitude) {
+          const lat = data.latitude;
+          const lng = data.longitude;
+          setCurrentLocation([lat, lng]);
+          fetchAreaName(lat, lng);
+          console.log(`IP-based location success (API 1): (${lat}, ${lng})`);
+          setFetchingLocation(false);
+          return;
+        }
+      }
+    } catch (ipErr) {
+      console.error('IP Geolocation fallback 1 failed:', ipErr);
+    }
+
+    try {
+      const response = await fetch('https://ipwho.is/');
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.latitude && data.longitude) {
+          const lat = data.latitude;
+          const lng = data.longitude;
+          setCurrentLocation([lat, lng]);
+          fetchAreaName(lat, lng);
+          console.log(`IP-based location success (API 2): (${lat}, ${lng})`);
+          setFetchingLocation(false);
+          return;
+        }
+      }
+    } catch (ipErr2) {
+      console.error('IP Geolocation fallback 2 failed:', ipErr2);
+    }
+
+    setLocationError(`${reason} Fallback failed. Using default coordinates.`);
+    setCurrentLocation(DEFAULT_COORDS);
+    fetchAreaName(DEFAULT_COORDS[0], DEFAULT_COORDS[1]);
+    setFetchingLocation(false);
+  };
+
+  const fetchCurrentLocation = () => {
+    setFetchingLocation(true);
+    setLocationError('');
+
+    if (!navigator.geolocation) {
+      fetchIPLocation('Geolocation is not supported by this browser.');
+      return;
+    }
+
+    const queryPosition = (highAccuracy = true) => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          setCurrentLocation([lat, lng]);
+          fetchAreaName(lat, lng);
+          setFetchingLocation(false);
+
+          // Emit real-time tracking update if there's an active distress case
+          if (activeCase && socket) {
+            socket.emit('update_location', {
+              userId: user.id,
+              latitude: lat,
+              longitude: lng
+            });
+          }
+        },
+        (err) => {
+          console.error(`HTML5 Geolocation error (HighAccuracy=${highAccuracy}):`, err);
+          if (highAccuracy && (err.code === err.POSITION_UNAVAILABLE || err.code === err.TIMEOUT)) {
+            console.log('High accuracy getCurrentPosition failed. Retrying with low accuracy...');
+            queryPosition(false);
+            return;
+          }
+
+          let reason = 'Failed to fetch location.';
+          if (err.code === err.PERMISSION_DENIED) {
+            reason = 'Location access is required to display your current location.';
+          } else if (err.code === err.POSITION_UNAVAILABLE) {
+            reason = 'Position unavailable.';
+          } else if (err.code === err.TIMEOUT) {
+            reason = 'Request timed out.';
+          }
+          fetchIPLocation(reason);
+        },
+        { enableHighAccuracy: highAccuracy, timeout: highAccuracy ? 8000 : 5000, maximumAge: 0 }
+      );
+    };
+
+    queryPosition(true);
+  };
+
+  const updateMapResponderLocation = (loc) => {
+    if (mapRef.current && loc) {
+      const latLng = [loc.lat || loc.latitude, loc.lng || loc.longitude];
+      if (responderMarkerRef.current) {
+        responderMarkerRef.current.setLatLng(latLng);
+      } else {
+        responderMarkerRef.current = L.marker(latLng, {
+          icon: L.divIcon({
+            className: 'custom-div-icon',
+            html: `<div style="background: rgba(37, 99, 235, 0.2); border: 2px solid #2563EB; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #2563EB; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+            iconSize: [40, 40],
+            iconAnchor: [20, 20],
+          })
+        }).addTo(mapRef.current).bindPopup('<b>Responder Dispatched Unit</b>');
+      }
+    }
+  };
+
+  const fetchActiveCase = async () => {
+    try {
+      const res = await sosAPI.getActive();
+      if (res.success && res.cases) {
+        const myActive = res.cases.find(c => c.user?._id === user.id || c.user === user.id);
+        setActiveCase(myActive || null);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const fetchHistory = async () => {
+    setLoadingHistory(true);
+    try {
+      const res = await sosAPI.getHistory();
+      if (res.success) {
+        setHistory(res.cases || []);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
+
+  const startSOSCountdown = () => {
+    if (sosIntervalRef.current) return;
+    setSosCountdown(60);
+    sosIntervalRef.current = setInterval(() => {
+      setSosCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(sosIntervalRef.current);
+          sosIntervalRef.current = null;
+          triggerSOS();
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const cancelSOSCountdown = () => {
+    if (sosIntervalRef.current) {
+      clearInterval(sosIntervalRef.current);
+      sosIntervalRef.current = null;
+      setSosCountdown(null);
+    }
+  };
+
+  const sendSOSImmediately = () => {
+    cancelSOSCountdown();
+    triggerSOS();
+  };
+
+  const triggerSOS = () => {
+    setLoadingSOS(true);
+    const sendSOS = (lat, lng) => {
+      sosAPI.trigger({ latitude: lat, longitude: lng, silent: silentSOS })
+        .then((res) => {
+          if (res.success) {
+            setActiveCase(res.case);
+            fetchHistory();
+          }
+        })
+        .catch((err) => {
+          alert('SOS trigger failed: ' + err.message);
+        })
+        .finally(() => {
+          setLoadingSOS(false);
+        });
+    };
+
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => sendSOS(pos.coords.latitude, pos.coords.longitude),
+        () => sendSOS(DEFAULT_COORDS[0], DEFAULT_COORDS[1]),
+        { enableHighAccuracy: true, timeout: 5000 }
+      );
+    } else {
+      sendSOS(DEFAULT_COORDS[0], DEFAULT_COORDS[1]);
+    }
+  };
+
+  const resolveSOSCase = async () => {
+    if (!activeCase || !window.confirm('Resolve this active case?')) return;
+    try {
+      const res = await sosAPI.resolve(activeCase._id, 5, 'Resolved by citizen user');
+      if (res.success) {
+        setActiveCase(null);
+        fetchHistory();
+      }
+    } catch (err) {
+      alert('Error resolving SOS: ' + err.message);
+    }
+  };
+
+  const handleAddContact = async (e) => {
+    e.preventDefault();
+    if (!contactForm.name || !contactForm.phone || !contactForm.relation) return;
+
+    setUpdatingContacts(true);
+    try {
+      const updated = [...(user.emergencyContacts || []), contactForm];
+      const res = await authAPI.updateProfile({ emergencyContacts: updated });
+      if (res.success) {
+        refreshUser();
+        setContactForm({ name: '', relation: '', phone: '' });
+      }
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setUpdatingContacts(false);
+    }
+  };
+
+  const handleDeleteContact = async (index) => {
+    if (!window.confirm('Delete contact?')) return;
+
+    setUpdatingContacts(true);
+    try {
+      const updated = (user.emergencyContacts || []).filter((_, i) => i !== index);
+      const res = await authAPI.updateProfile({ emergencyContacts: updated });
+      if (res.success) {
+        refreshUser();
+      }
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setUpdatingContacts(false);
+    }
+  };
+
+  const handleIdUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setUploadError('');
+    setUploadingId(true);
+    const formData = new FormData();
+    formData.append('idImage', file);
+
+    try {
+      const res = await authAPI.uploadId(formData);
+      if (res.success) {
+        refreshUser();
+      }
+    } catch (err) {
+      setUploadError(err.message);
+    } finally {
+      setUploadingId(false);
+    }
+  };
+
+  return (
+    <>
+      {/* Premium Welcome & Location Toast */}
+      {welcomeToast && (
+        <div 
+          style={{
+            position: 'fixed',
+            top: '24px',
+            right: '24px',
+            zIndex: 9999,
+            width: '360px',
+            background: 'rgba(15, 23, 42, 0.85)',
+            backdropFilter: 'blur(16px)',
+            WebkitBackdropFilter: 'blur(16px)',
+            border: '1px solid rgba(16, 185, 129, 0.3)',
+            borderRadius: '16px',
+            padding: '16px 20px',
+            boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4), 0 0 30px rgba(16, 185, 129, 0.15)',
+            display: 'flex',
+            gap: '14px',
+            animation: 'slideInRight 0.4s cubic-bezier(0.16, 1, 0.3, 1)'
+          }}
+        >
+          {/* Green active pulse ring icon */}
+          <div 
+            style={{ 
+              background: 'rgba(16, 185, 129, 0.15)', 
+              border: '1px solid rgba(16, 185, 129, 0.3)', 
+              borderRadius: '50%', 
+              width: '40px', 
+              height: '40px', 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'center',
+              flexShrink: 0,
+              marginTop: '2px'
+            }}
+          >
+            <MapPin size={20} color="#10B981" />
+          </div>
+
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <h4 style={{ color: 'white', fontWeight: 800, fontSize: '14px', margin: '0 0 4px 0', fontFamily: "'Space Grotesk', sans-serif" }}>
+              {welcomeToast.title}
+            </h4>
+            <p style={{ color: '#CBD5E1', fontSize: '12px', margin: '0 0 6px 0', fontWeight: 500, lineHeight: '1.4' }}>
+              {welcomeToast.message}
+            </p>
+            {welcomeToast.coords && (
+              <span style={{ display: 'inline-block', fontFamily: 'monospace', fontSize: '10px', color: '#06B6D4', background: 'rgba(6, 182, 212, 0.1)', padding: '2px 6px', borderRadius: '4px', fontWeight: 600 }}>
+                {welcomeToast.coords}
+              </span>
+            )}
+          </div>
+
+          <button 
+            onClick={() => setWelcomeToast(null)}
+            style={{ 
+              background: 'none', 
+              border: 'none', 
+              color: '#64748B', 
+              cursor: 'pointer', 
+              fontSize: '16px', 
+              fontWeight: 'bold', 
+              padding: '0 4px', 
+              alignSelf: 'flex-start' 
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      <div className="animate-fade-in" style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: '24px', padding: '24px' }}>
+      
+      {/* Left Area: distress Map & immediate SOS triggers */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
+
+        {/* Safety & Real-Time Location Status Banner */}
+        <div 
+          className="glass-panel" 
+          style={{ 
+            padding: '20px 24px', 
+            background: activeCase 
+              ? 'linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(17, 24, 39, 0.7) 100%)' 
+              : 'linear-gradient(135deg, rgba(16, 185, 129, 0.08) 0%, rgba(17, 24, 39, 0.7) 100%)',
+            border: `1px solid ${activeCase ? 'rgba(239, 68, 68, 0.25)' : 'rgba(16, 185, 129, 0.25)'}`,
+            borderRadius: '20px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '16px',
+            boxShadow: activeCase 
+              ? '0 10px 30px -10px rgba(239, 68, 68, 0.2)' 
+              : '0 10px 30px -10px rgba(16, 185, 129, 0.15)',
+            position: 'relative',
+            overflow: 'hidden'
+          }}
+        >
+          {/* Decorative ambient background glows */}
+          <div 
+            style={{ 
+              position: 'absolute', 
+              top: '-20%', 
+              right: '-10%', 
+              width: '180px', 
+              height: '180px', 
+              background: activeCase ? 'rgba(239, 68, 68, 0.12)' : 'rgba(16, 185, 129, 0.12)', 
+              borderRadius: '50%', 
+              filter: 'blur(30px)', 
+              pointerEvents: 'none' 
+            }} 
+          />
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+              <div 
+                style={{ 
+                  background: activeCase ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)', 
+                  border: `1px solid ${activeCase ? 'rgba(239, 68, 68, 0.3)' : 'rgba(16, 185, 129, 0.3)'}`,
+                  borderRadius: '14px', 
+                  padding: '12px',
+                  display: 'flex', 
+                  alignItems: 'center', 
+                  justifyContent: 'center',
+                  boxShadow: activeCase ? '0 0 15px rgba(239, 68, 68, 0.1)' : '0 0 15px rgba(16, 185, 129, 0.1)'
+                }}
+              >
+                {activeCase ? (
+                  <ShieldAlert size={28} style={{ color: '#EF4444', animation: 'pulse 1.5s infinite' }} />
+                ) : (
+                  <CheckCircle size={28} style={{ color: '#10B981' }} />
+                )}
+              </div>
+              <div>
+                <span style={{ fontSize: '10px', color: '#94A3B8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '1px' }}>
+                  System Security Status
+                </span>
+                <h3 style={{ fontSize: '20px', fontWeight: 800, color: 'white', margin: '2px 0 0 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  {activeCase ? (
+                    <>
+                      Distress SOS Active 
+                      <span style={{ fontSize: '11px', background: 'rgba(239,68,68,0.2)', color: '#FCA5A5', padding: '2px 8px', borderRadius: '999px', border: '1px solid rgba(239,68,68,0.3)', fontWeight: 700 }}>LIVE TRACKING</span>
+                    </>
+                  ) : (
+                    <>
+                      You are Safe 
+                      <span style={{ fontSize: '11px', background: 'rgba(16,185,129,0.2)', color: '#A7F3D0', padding: '2px 8px', borderRadius: '999px', border: '1px solid rgba(16,185,129,0.3)', fontWeight: 700 }}>SECURED</span>
+                    </>
+                  )}
+                </h3>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              {!activeCase && (
+                <button
+                  onClick={fetchCurrentLocation}
+                  disabled={fetchingLocation}
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.03)',
+                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                    borderRadius: '12px',
+                    padding: '8px 16px',
+                    color: '#E2E8F0',
+                    fontSize: '12px',
+                    fontWeight: 700,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s',
+                    boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255, 255, 255, 0.06)'; e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.15)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255, 255, 255, 0.03)'; e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.08)'; }}
+                  title="Update GPS coordinates"
+                >
+                  <RefreshCw size={14} className={fetchingLocation ? 'animate-spin' : ''} style={{ color: '#06B6D4' }} />
+                  Refresh GPS
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div 
+            style={{ 
+              display: 'grid', 
+              gridTemplateColumns: '1fr 1fr', 
+              gap: '12px', 
+              borderTop: '1px solid rgba(255, 255, 255, 0.06)', 
+              paddingTop: '16px',
+              marginTop: '4px'
+            }}
+          >
+            {/* Locality Panel */}
+            <div 
+              style={{ 
+                background: 'rgba(255, 255, 255, 0.015)', 
+                border: '1px solid rgba(255, 255, 255, 0.04)', 
+                borderRadius: '14px', 
+                padding: '12px 16px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px'
+              }}
+            >
+              <div 
+                style={{ 
+                  background: activeCase ? 'rgba(239, 68, 68, 0.1)' : 'rgba(99, 102, 241, 0.1)', 
+                  border: `1px solid ${activeCase ? 'rgba(239, 68, 68, 0.2)' : 'rgba(99, 102, 241, 0.2)'}`, 
+                  borderRadius: '10px', 
+                  padding: '8px', 
+                  display: 'flex', 
+                  alignItems: 'center', 
+                  justifyContent: 'center' 
+                }}
+              >
+                <MapPin size={16} color={activeCase ? '#EF4444' : '#818CF8'} />
+              </div>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <span style={{ display: 'block', fontSize: '9px', color: '#64748B', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Current Area / Locality</span>
+                <span style={{ fontSize: '13px', fontWeight: 600, color: 'white', display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={currentArea || 'Fetching Location...'}>
+                  {fetchingLocation ? 'Pinpointing...' : (currentArea || 'Bengaluru, India')}
+                </span>
+              </div>
+            </div>
+
+            {/* GPS Coordinates Panel */}
+            <div 
+              style={{ 
+                background: 'rgba(255, 255, 255, 0.015)', 
+                border: '1px solid rgba(255, 255, 255, 0.04)', 
+                borderRadius: '14px', 
+                padding: '12px 16px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px'
+              }}
+            >
+              <div 
+                style={{ 
+                  background: 'rgba(6, 182, 212, 0.1)', 
+                  border: '1px solid rgba(6, 182, 212, 0.2)', 
+                  borderRadius: '10px', 
+                  padding: '8px', 
+                  display: 'flex', 
+                  alignItems: 'center', 
+                  justifyContent: 'center' 
+                }}
+              >
+                <Navigation size={16} color="#06B6D4" />
+              </div>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <span style={{ display: 'block', fontSize: '9px', color: '#64748B', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Exact GPS Coordinates</span>
+                <span style={{ fontSize: '13px', fontWeight: 600, color: 'white', display: 'block', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {fetchingLocation && !currentLocation 
+                    ? 'Loading...' 
+                    : (currentLocation ? `${currentLocation[0].toFixed(5)}°, ${currentLocation[1].toFixed(5)}°` : 'Searching...')}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <div className={`glass-panel ${activeCase ? 'distress-glow' : ''}`} style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <Shield size={22} style={{ color: activeCase ? '#EF4444' : '#6366F1' }} />
+              <div>
+                <h2 style={{ fontSize: '16px', fontWeight: 800, color: 'white' }}>
+                  Live Emergency Tracking Map
+                </h2>
+                <span style={{ fontSize: '11px', color: '#94A3B8', display: 'block', marginTop: '2px' }}>
+                  {activeCase ? `SOS Active Incident Ref: ${activeCase._id}` : 'Leaflet 2D Real-time Spatial Map'}
+                </span>
+              </div>
+            </div>
+            
+            <div>
+              <span className={`badge ${activeCase ? 'badge-error' : 'badge-success'}`} style={{ textTransform: 'uppercase', fontWeight: 700 }}>
+                {activeCase ? activeCase.status : 'Safe'}
+              </span>
+            </div>
+          </div>
+
+          {locationError && (
+            <div style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '8px', padding: '10px 14px', color: '#F87171', fontSize: '12px' }}>
+              ⚠️ {locationError}
+            </div>
+          )}
+
+          {/* Leaflet GPS map is always rendered */}
+          <div ref={mapContainerRef} style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', zIndex: 1 }} />
+
+          {/* Context controls based on distress states */}
+          {activeCase ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              {activeCase.status === 'accepted' && activeCase.responderTimeline?.[0] && (
+                <div style={{ background: 'rgba(59, 130, 246, 0.06)', border: '1px solid rgba(59, 130, 246, 0.2)', borderRadius: '12px', padding: '16px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <Clock size={20} style={{ color: '#3B82F6' }} />
+                  <div>
+                    <h4 style={{ color: 'white', fontWeight: 600, fontSize: '13px' }}>Responder En Route</h4>
+                    <p style={{ color: '#94A3B8', fontSize: '12px', margin: '2px 0 0' }}>Estimated Arrival: {activeCase.responderTimeline[0].eta || 'Pending'} mins</p>
+                  </div>
+                </div>
+              )}
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '16px' }}>
+                <p style={{ color: '#94A3B8', fontSize: '11px', maxWidth: '400px' }}>Your coordinates are streaming live to the nearest help provider.</p>
+                <button onClick={resolveSOSCase} style={{ background: 'linear-gradient(135deg, #10B981, #059669)', border: 'none', color: 'white', fontWeight: 600, padding: '10px 18px', borderRadius: '8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <CheckCircle size={14} /> Resolve Case
+                </button>
+              </div>
+            </div>
+          ) : sosCountdown !== null ? (
+              <div style={{ display: 'flex', width: '100%', flexDirection: 'column', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '18px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <AlertTriangle size={18} className="text-red-400 animate-pulse" />
+                    <span style={{ fontSize: '12px', color: '#F87171', fontWeight: 700 }}>
+                      SOS Pending Auto-Send: {sosCountdown}s
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button onClick={cancelSOSCountdown} style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)', color: '#CBD5E1', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '11px', fontWeight: 600 }}>
+                      Cancel SOS
+                    </button>
+                    <button onClick={sendSOSImmediately} style={{ background: '#EF4444', border: 'none', color: 'white', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '11px', fontWeight: 700 }}>
+                      Send Now
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '18px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'rgba(255,255,255,0.02)', padding: '6px 12px', borderRadius: '10px' }}>
+                  <EyeOff size={14} style={{ color: silentSOS ? '#EF4444' : '#64748B' }} />
+                  <span style={{ fontSize: '11px', color: '#CBD5E1', fontWeight: 600 }}>Silent SOS Alert</span>
+                  <input type="checkbox" className="toggle toggle-error toggle-xs" checked={silentSOS} onChange={(e) => setSilentSOS(e.target.checked)} />
+                </div>
+
+                <button
+                  onClick={startSOSCountdown}
+                  disabled={loadingSOS}
+                  style={{
+                    background: 'linear-gradient(135deg, #EF4444, #B91C1C)',
+                    border: 'none', color: 'white',
+                    fontSize: '12px', fontWeight: 900, cursor: 'pointer',
+                    padding: '10px 24px', borderRadius: '8px',
+                    boxShadow: '0 4px 15px rgba(239,68,68,0.2)', transition: 'all 0.2s',
+                    display: 'flex', alignItems: 'center', gap: '6px'
+                  }}
+                >
+                  <AlertTriangle size={14} /> TRIGGER SOS
+                </button>
+              </div>
+            )}
+
+        </div>
+
+        <div className="glass-panel" style={{ padding: '24px' }}>
+          <h3 style={{ fontSize: '15px', fontWeight: 700, color: 'white', marginBottom: '16px' }}>Incident Logs</h3>
+          {loadingHistory ? (
+            <div style={{ textAlign: 'center', padding: '16px' }}><span className="loading loading-spinner"></span></div>
+          ) : history.length === 0 ? (
+            <p style={{ color: '#475569', fontSize: '12px', textAlign: 'center' }}>No incidents logged.</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              {history.map((h) => (
+                <div key={h._id} style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.03)', borderRadius: '10px', padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    <span style={{ fontSize: '12px', fontWeight: 700, color: 'white' }}>Ref: {h._id.slice(-6)}</span>
+                    <span style={{ fontSize: '10px', color: '#64748B', display: 'block' }}>{formatDate(h.createdAt)}</span>
+                  </div>
+                  <span className={`badge badge-sm ${h.status === 'resolved' ? 'badge-success' : 'badge-error'}`} style={{ textTransform: 'uppercase', fontSize: '9px', fontWeight: 700 }}>{h.status}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {/* Right Area: ID uploads & Contacts list */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
+        
+        <div className="glass-panel" style={{ padding: '20px' }}>
+          <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'white', marginBottom: '14px' }}>Account Status</h3>
+          <div style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.03)', borderRadius: '10px', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ fontSize: '16px' }}>{user.idVerification?.status === 'verified' ? '🟢' : '🔴'}</span>
+            <div>
+              <span style={{ fontSize: '13px', fontWeight: 700, color: 'white' }}>Verification status</span>
+              <span style={{ display: 'block', fontSize: '11px', color: '#64748B' }}>{user.idVerification?.status || 'unverified'}</span>
+            </div>
+          </div>
+          {user.idVerification?.status !== 'verified' && (
+            <div style={{ marginTop: '14px' }}>
+              <label className="shine-btn" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', background: 'linear-gradient(135deg, #6366F1, #4F46E5)', border: 'none', color: 'white', fontSize: '12px', fontWeight: 600, padding: '8px 12px', borderRadius: '8px', cursor: 'pointer' }}>
+                <UploadCloud size={14} /> Upload verification document
+                <input type="file" style={{ display: 'none' }} accept="image/*" onChange={handleIdUpload} />
+              </label>
+              {uploadError && <p style={{ color: '#EF4444', fontSize: '11px', marginTop: '6px' }}>{uploadError}</p>}
+            </div>
+          )}
+        </div>
+
+        <div className="glass-panel" style={{ padding: '20px' }}>
+          <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'white', marginBottom: '14px' }}>Contacts</h3>
+          <form onSubmit={handleAddContact} style={{ display: 'flex', flexDirection: 'column', gap: '10px', background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.03)', borderRadius: '10px', padding: '10px' }}>
+            <input type="text" placeholder="Name" value={contactForm.name} onChange={(e) => setContactForm(p => ({ ...p, name: e.target.value }))} style={{ width: '100%', boxSizing: 'border-box', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '6px', padding: '6px 10px', color: 'white', fontSize: '12px' }} required />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+              <input type="text" placeholder="Relation" value={contactForm.relation} onChange={(e) => setContactForm(p => ({ ...p, relation: e.target.value }))} style={{ width: '100%', minWidth: '0', boxSizing: 'border-box', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '6px', padding: '6px 10px', color: 'white', fontSize: '12px' }} required />
+              <input type="tel" placeholder="Phone" value={contactForm.phone} onChange={(e) => setContactForm(p => ({ ...p, phone: e.target.value }))} style={{ width: '100%', minWidth: '0', boxSizing: 'border-box', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '6px', padding: '6px 10px', color: 'white', fontSize: '12px' }} required />
+            </div>
+            <button type="submit" style={{ background: 'rgba(6, 182, 212, 0.1)', border: '1px solid rgba(6, 182, 212, 0.3)', color: '#06B6D4', borderRadius: '6px', padding: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>Add Contact</button>
+          </form>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px' }}>
+            {(user.emergencyContacts || []).map((c, idx) => (
+              <div key={idx} style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.03)', borderRadius: '8px', padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <span style={{ fontSize: '12px', fontWeight: 700, color: 'white', display: 'block' }}>{c.name}</span>
+                  <span style={{ fontSize: '10px', color: '#64748B' }}>{c.relation} • {c.phone}</span>
+                </div>
+                <button onClick={() => handleDeleteContact(idx)} style={{ background: 'none', border: 'none', color: '#EF4444', cursor: 'pointer' }}><Trash2 size={12} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+    </>
+  );
+};
+
+export default CitizenDashboard;

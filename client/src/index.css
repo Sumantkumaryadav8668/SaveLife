@@ -1,0 +1,238 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700;900&family=Outfit:wght@300;400;500;700;900&display=swap');
+@import "tailwindcss";
+@plugin "daisyui";
+@import './styles/responsive.css';
+@import './styles/auth.css';
+@import './styles/dashboard.css';
+
+
+
+
+/* --- Theme variables --- */
+:root {
+  --bg-primary: #f8fafc;
+  --bg-secondary: #f1f5f9;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --accent-indigo: #4f46e5;
+  --accent-purple: #7c3aed;
+  --accent-red: #ef4444;
+  --accent-emerald: #10b981;
+  --card-bg: rgba(255, 255, 255, 0.7);
+  --card-border: rgba(15, 23, 42, 0.08);
+  --card-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
+  --scrollbar-thumb: #cbd5e1;
+}
+
+[data-theme='dark'] {
+  --bg-primary: #0b0f19;
+  --bg-secondary: #0f172a;
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --card-bg: rgba(15, 23, 42, 0.45);
+  --card-border: rgba(255, 255, 255, 0.08);
+  --card-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+  --scrollbar-thumb: #334155;
+}
+
+/* Global Reset */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Outfit', sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  transition: background-color 0.3s, color 0.3s;
+  overflow-x: hidden;
+}
+
+/* Scrollbar customization */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 99px;
+}
+
+/* Header & Shell Styling */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.dashboard-header {
+  backdrop-filter: blur(12px);
+  background: rgba(15, 23, 42, 0.03);
+  border-bottom: 1px solid var(--card-border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  transition: all 0.3s;
+}
+
+[data-theme='dark'] .dashboard-header {
+  background: rgba(11, 15, 25, 0.7);
+}
+
+.dashboard-container {
+  flex: 1;
+  width: 100%;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+/* Premium Card Styles */
+.stat-card {
+  background: var(--card-bg);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--card-border);
+  box-shadow: var(--card-shadow);
+  border-radius: 20px;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.08);
+}
+
+[data-theme='dark'] .stat-card:hover {
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4);
+}
+
+/* Warning Halo Alarms */
+.sos-btn {
+  background: transparent;
+  border: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+}
+
+.sos-core {
+  width: 100px;
+  height: 100px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  z-index: 5;
+  transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.sos-btn:hover .sos-core {
+  transform: scale(1.08);
+}
+
+.sos-btn.standard .sos-core {
+  background: linear-gradient(135deg, #ef4444, #b91c1c);
+  box-shadow: 0 10px 25px rgba(239, 68, 68, 0.4), inset 0 -4px 10px rgba(0,0,0,0.3);
+}
+
+.sos-btn.silent .sos-core {
+  background: linear-gradient(135deg, #7c3aed, #5b21b6);
+  box-shadow: 0 10px 25px rgba(124, 58, 237, 0.4), inset 0 -4px 10px rgba(0,0,0,0.3);
+}
+
+/* SOS Ring Pulse Wave Animations */
+.sos-btn::before, .sos-btn::after {
+  content: '';
+  position: absolute;
+  top: 50px;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 100px;
+  height: 100px;
+  border-radius: 50%;
+  z-index: 1;
+  pointer-events: none;
+  animation: alarm-wave 2s infinite cubic-bezier(0.1, 0.8, 0.3, 1);
+}
+
+.sos-btn.standard::before { background: rgba(239, 68, 68, 0.3); }
+.sos-btn.standard::after { background: rgba(239, 68, 68, 0.15); animation-delay: 0.8s; }
+
+.sos-btn.silent::before { background: rgba(124, 58, 237, 0.3); }
+.sos-btn.silent::after { background: rgba(124, 58, 237, 0.15); animation-delay: 0.8s; }
+
+@keyframes alarm-wave {
+  0% { width: 100px; height: 100px; opacity: 1; }
+  100% { width: 190px; height: 190px; opacity: 0; }
+}
+
+/* Forms & Inputs */
+input, textarea, select {
+  font-family: inherit;
+  transition: all 0.2s;
+}
+
+input:focus, textarea:focus, select:focus {
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.15);
+}
+
+/* Tailored tabs styles for Admin Dashboard */
+.tab-btn {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tab-btn.active {
+  color: white;
+  background: var(--accent-indigo);
+  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.25);
+}
+
+[data-theme='dark'] .tab-btn.active {
+  background: #4f46e5;
+}
+
+.tab-btn:not(.active):hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+/* Leaflet maps custom fixes */
+.leaflet-container {
+  font-family: inherit;
+  background-color: #0f172a !important;
+}
+
+.leaflet-popup-content-wrapper {
+  background: rgba(15, 23, 42, 0.95) !important;
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #f1f5f9 !important;
+  border-radius: 12px !important;
+}
+
+.leaflet-popup-tip {
+  background: rgba(15, 23, 42, 0.95) !important;
+}
+
+@keyframes slideInRight {
+  from {
+    transform: translateX(120%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}

@@ -1,0 +1,59 @@
+/* Responsive utilities and media query breakpoints */
+
+/* ─── Responsive grid helpers ─── */
+@media (max-width: 768px) {
+  .dashboard-container {
+    padding: 12px 12px !important;
+  }
+
+  /* Stack 2-col grids on mobile */
+  .grid-2-col {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Header collapses to icon-only on very small screens */
+  .header-brand-subtitle {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .auth-card {
+    padding: 28px 20px !important;
+    border-radius: 16px !important;
+  }
+
+  .register-grid-2 {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ─── Notification panel animations ─── */
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes ping {
+  0%         { transform: scale(1); opacity: 1; }
+  75%, 100%  { transform: scale(2); opacity: 0; }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes shine {
+  0%   { left: -120%; }
+  100% { left: 120%; }
+}
