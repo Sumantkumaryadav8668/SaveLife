@@ -92,6 +92,9 @@ const CitizenDashboard = () => {
   const [activeCase, setActiveCase] = useState(null);
   const [loadingSOS, setLoadingSOS] = useState(false);
   const [silentSOS, setSilentSOS] = useState(false);
+  const [description, setDescription] = useState('');
+  const [locationAccuracy, setLocationAccuracy] = useState(null);
+  const [locationSource, setLocationSource] = useState('fallback');
 
   // SOS countdown states
   const [sosCountdown, setSosCountdown] = useState(null);
@@ -121,6 +124,8 @@ const CitizenDashboard = () => {
   const mapRef = useRef(null);
   const citizenMarkerRef = useRef(null);
   const responderMarkerRef = useRef(null);
+  const accuracyCircleRef = useRef(null);
+  const userHasPannedRef = useRef(false);
 
   const currentLocationRef = useRef(currentLocation);
   useEffect(() => {
@@ -132,10 +137,43 @@ const CitizenDashboard = () => {
     fetchHistory();
   }, []);
 
+  // Handle offline SOS request sync on connection recovery
+  useEffect(() => {
+    const handleOnline = () => {
+      const pendingSosStr = localStorage.getItem('pending_offline_sos');
+      if (pendingSosStr) {
+        const pendingSos = JSON.parse(pendingSosStr);
+        console.log('[Offline Sync] Syncing queued offline SOS request:', pendingSos);
+        
+        setLoadingSOS(true);
+        sosAPI.trigger(pendingSos)
+          .then((res) => {
+            if (res.success) {
+              setActiveCase(res.case);
+              localStorage.removeItem('pending_offline_sos');
+              setDescription('');
+              fetchHistory();
+              alert('Successfully synchronized and dispatched your offline SOS request!');
+            }
+          })
+          .catch((err) => {
+            console.error('[Offline Sync] Sync SOS failed:', err);
+          })
+          .finally(() => {
+            setLoadingSOS(false);
+          });
+      }
+    };
+
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, [socket, activeCase]);
+
   // Live location tracking and socket synchronization
   useEffect(() => {
     if (!navigator.geolocation) {
-      fetchIPLocation('Geolocation is not supported by this browser.');
+      setLocationError('Geolocation is not supported by this browser.');
+      setFetchingLocation(false);
       return;
     }
 
@@ -147,7 +185,10 @@ const CitizenDashboard = () => {
         (pos) => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
+          const acc = pos.coords.accuracy;
           setCurrentLocation([lat, lng]);
+          setLocationAccuracy(acc);
+          setLocationSource(highAccuracy ? 'gps' : 'network');
           fetchAreaName(lat, lng);
           setFetchingLocation(false);
           setLocationError('');
@@ -156,8 +197,10 @@ const CitizenDashboard = () => {
           if (activeCase && socket) {
             socket.emit('update_location', {
               userId: user.id,
+              role: user.role,
               latitude: lat,
-              longitude: lng
+              longitude: lng,
+              sosId: activeCase._id
             });
           }
 
@@ -179,22 +222,17 @@ const CitizenDashboard = () => {
 
           let reason = 'Failed to fetch location.';
           if (err.code === err.PERMISSION_DENIED) {
-            reason = 'Location access is required to display your current location.';
+            reason = 'Location permission is required to show your current location.';
           } else if (err.code === err.POSITION_UNAVAILABLE) {
-            reason = 'Position unavailable.';
+            reason = 'Unable to determine your current location. Please check your GPS/location settings.';
           } else if (err.code === err.TIMEOUT) {
-            reason = 'Request timed out.';
+            reason = 'Location request timed out. Please try again.';
           }
           
-          // If we don't have a location yet, try IP fallback
-          if (!currentLocationRef.current) {
-            fetchIPLocation(reason);
-          } else {
-            setLocationError(reason);
-            setFetchingLocation(false);
-          }
+          setLocationError(reason);
+          setFetchingLocation(false);
         },
-        { enableHighAccuracy: highAccuracy, timeout: highAccuracy ? 8000 : 5000, maximumAge: 0 }
+        { enableHighAccuracy: highAccuracy, timeout: 10000, maximumAge: 0 }
       );
     };
 
@@ -205,76 +243,157 @@ const CitizenDashboard = () => {
     };
   }, [activeCase, socket, user.id]);
 
+  // Emit join case room on activeCase load
+  useEffect(() => {
+    if (socket && activeCase) {
+      socket.emit('join', { role: user.role, userId: user.id, sosId: activeCase._id });
+    }
+  }, [socket, activeCase, user.id, user.role]);
+
   useEffect(() => {
     if (!socket) return;
 
+    const handleSOSAccepted = (data) => {
+      if (activeCase && (data.case?._id === activeCase._id || data.caseId === activeCase._id)) {
+        fetchActiveCase();
+      }
+    };
+
     const handleSOSUpdate = (data) => {
-      if (activeCase && data.caseId === activeCase._id) {
+      if (activeCase && (data.case?._id === activeCase._id || data.caseId === activeCase._id)) {
         fetchActiveCase();
       }
     };
 
     const handleSOSResolved = (data) => {
-      if (activeCase && data.caseId === activeCase._id) {
+      if (activeCase && (data.case?._id === activeCase._id || data.caseId === activeCase._id)) {
         setActiveCase(null);
         fetchHistory();
       }
     };
 
-    const handleTrackingUpdate = (data) => {
-      if (activeCase && data.caseId === activeCase._id && data.responderLocation) {
-        updateMapResponderLocation(data.responderLocation);
+    const handleResponderLocation = (data) => {
+      if (activeCase && data.caseId === activeCase._id && data.coordinates) {
+        updateMapResponderLocation({ lat: data.coordinates[1], lng: data.coordinates[0] });
       }
     };
 
-    socket.on('sos_status_update', handleSOSUpdate);
-    socket.on('sos_resolved', handleSOSResolved);
-    socket.on('tracking_update', handleTrackingUpdate);
+    const handleAmbulanceLocation = (data) => {
+      if (activeCase && data.caseId === activeCase._id && data.location) {
+        updateMapResponderLocation({ lat: data.location.lat, lng: data.location.lng });
+      }
+    };
+
+    socket.on('sos:accepted', handleSOSAccepted);
+    socket.on('sos:status_updated', handleSOSUpdate);
+    socket.on('sos:resolved', handleSOSResolved);
+    socket.on('responder:location_updated', handleResponderLocation);
+    socket.on('ambulance:location_updated', handleAmbulanceLocation);
 
     return () => {
-      socket.off('sos_status_update', handleSOSUpdate);
-      socket.off('sos_resolved', handleSOSResolved);
-      socket.off('tracking_update', handleTrackingUpdate);
+      socket.off('sos:accepted', handleSOSAccepted);
+      socket.off('sos:status_updated', handleSOSUpdate);
+      socket.off('sos:resolved', handleSOSResolved);
+      socket.off('responder:location_updated', handleResponderLocation);
+      socket.off('ambulance:location_updated', handleAmbulanceLocation);
     };
   }, [socket, activeCase]);
 
   // Handle map rendering for both safe (current location) and active distress tracking
+  const [currentLat, currentLng] = currentLocation || [null, null];
   useEffect(() => {
     // If we have an active distress case, center on it. Otherwise center on tracked location
     const coordinates = activeCase?.location?.coordinates || (currentLocation ? [currentLocation[1], currentLocation[0]] : null);
     const latLng = coordinates ? [coordinates[1], coordinates[0]] : DEFAULT_COORDS;
 
     if (!mapRef.current && mapContainerRef.current) {
-      mapRef.current = L.map(mapContainerRef.current).setView(latLng, 14);
+      mapRef.current = L.map(mapContainerRef.current, {
+        scrollWheelZoom: true,
+        dragging: true,
+        zoomControl: true,
+        doubleClickZoom: true,
+        touchZoom: true
+      }).setView(latLng, 14);
+
+      mapRef.current.dragging.enable();
+
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; OpenStreetMap contributors',
       }).addTo(mapRef.current);
 
-      citizenMarkerRef.current = L.marker(latLng, {
-        icon: L.divIcon({
-          className: 'custom-div-icon',
-          html: activeCase 
-            ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
-            : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
-          iconSize: [40, 40],
-          iconAnchor: [20, 20],
-        })
-      }).addTo(mapRef.current).bindPopup(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>').openPopup();
+      mapRef.current.on('dragstart zoomstart', () => {
+        userHasPannedRef.current = true;
+      });
+
+      if (currentLocation || activeCase) {
+        citizenMarkerRef.current = L.marker(latLng, {
+          icon: L.divIcon({
+            className: 'custom-div-icon',
+            html: activeCase 
+              ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
+              : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+            iconSize: [40, 40],
+            iconAnchor: [20, 20],
+          })
+        }).addTo(mapRef.current).bindPopup(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>').openPopup();
+      }
     } else if (mapRef.current) {
-      mapRef.current.setView(latLng);
-      if (citizenMarkerRef.current) {
-        citizenMarkerRef.current.setLatLng(latLng);
-        citizenMarkerRef.current.setPopupContent(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>');
-        
-        // Re-inject icon HTML depending on active/inactive states
-        citizenMarkerRef.current.setIcon(L.divIcon({
-          className: 'custom-div-icon',
-          html: activeCase 
-            ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
-            : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
-          iconSize: [40, 40],
-          iconAnchor: [20, 20],
-        }));
+      if (!userHasPannedRef.current) {
+        mapRef.current.setView(latLng);
+      }
+      if (currentLocation || activeCase) {
+        if (!citizenMarkerRef.current) {
+          citizenMarkerRef.current = L.marker(latLng, {
+            icon: L.divIcon({
+              className: 'custom-div-icon',
+              html: activeCase 
+                ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
+                : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+              iconSize: [40, 40],
+              iconAnchor: [20, 20],
+            })
+          }).addTo(mapRef.current).bindPopup(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>').openPopup();
+        } else {
+          citizenMarkerRef.current.setLatLng(latLng);
+          citizenMarkerRef.current.setPopupContent(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>');
+          
+          // Re-inject icon HTML depending on active/inactive states
+          citizenMarkerRef.current.setIcon(L.divIcon({
+            className: 'custom-div-icon',
+            html: activeCase 
+              ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
+              : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+            iconSize: [40, 40],
+            iconAnchor: [20, 20],
+          }));
+        }
+      } else {
+        if (citizenMarkerRef.current) {
+          citizenMarkerRef.current.remove();
+          citizenMarkerRef.current = null;
+        }
+      }
+    }
+
+    // Update GPS accuracy circle
+    if (locationAccuracy && !activeCase && mapRef.current) {
+      if (!accuracyCircleRef.current) {
+        accuracyCircleRef.current = L.circle(latLng, {
+          radius: locationAccuracy,
+          color: '#6366F1',
+          fillColor: '#6366F1',
+          fillOpacity: 0.08,
+          weight: 1,
+          interactive: false
+        }).addTo(mapRef.current);
+      } else {
+        accuracyCircleRef.current.setLatLng(latLng);
+        accuracyCircleRef.current.setRadius(locationAccuracy);
+      }
+    } else {
+      if (accuracyCircleRef.current) {
+        accuracyCircleRef.current.remove();
+        accuracyCircleRef.current = null;
       }
     }
 
@@ -296,8 +415,10 @@ const CitizenDashboard = () => {
           responderMarkerRef.current.setLatLng(respLatLng);
         }
 
-        const group = new L.featureGroup([citizenMarkerRef.current, responderMarkerRef.current]);
-        mapRef.current.fitBounds(group.getBounds().pad(0.2));
+        if (!userHasPannedRef.current) {
+          const group = new L.featureGroup([citizenMarkerRef.current, responderMarkerRef.current]);
+          mapRef.current.fitBounds(group.getBounds().pad(0.2));
+        }
       }
     } else {
       if (responderMarkerRef.current) {
@@ -305,7 +426,17 @@ const CitizenDashboard = () => {
         responderMarkerRef.current = null;
       }
     }
-  }, [activeCase, currentLocation]);
+  }, [activeCase, currentLat, currentLng, locationAccuracy]);
+
+  // Separate map lifecycle cleanup hook
+  useEffect(() => {
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
+    };
+  }, []);
 
   const fetchIPLocation = async (reason) => {
     try {
@@ -354,6 +485,7 @@ const CitizenDashboard = () => {
   const fetchCurrentLocation = () => {
     setFetchingLocation(true);
     setLocationError('');
+    userHasPannedRef.current = false; // Reset pan state to allow recenter
 
     if (!navigator.geolocation) {
       fetchIPLocation('Geolocation is not supported by this browser.');
@@ -365,9 +497,15 @@ const CitizenDashboard = () => {
         (pos) => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
+          const acc = pos.coords.accuracy;
           setCurrentLocation([lat, lng]);
+          setLocationAccuracy(acc);
           fetchAreaName(lat, lng);
           setFetchingLocation(false);
+
+          if (mapRef.current) {
+            mapRef.current.setView([lat, lng], 15);
+          }
 
           // Emit real-time tracking update if there's an active distress case
           if (activeCase && socket) {
@@ -401,6 +539,11 @@ const CitizenDashboard = () => {
     };
 
     queryPosition(true);
+  };
+
+  const handleRecenterMap = () => {
+    userHasPannedRef.current = false;
+    fetchCurrentLocation();
   };
 
   const updateMapResponderLocation = (loc) => {
@@ -478,11 +621,29 @@ const CitizenDashboard = () => {
 
   const triggerSOS = () => {
     setLoadingSOS(true);
+    const clientRequestId = 'req_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+    
     const sendSOS = (lat, lng) => {
-      sosAPI.trigger({ latitude: lat, longitude: lng, silent: silentSOS })
+      const payload = { 
+        latitude: lat, 
+        longitude: lng, 
+        silent: silentSOS, 
+        description, 
+        clientRequestId 
+      };
+
+      if (!navigator.onLine) {
+        localStorage.setItem('pending_offline_sos', JSON.stringify(payload));
+        alert('You are offline. Your SOS request has been saved and queued locally. It will automatically dispatch once network connectivity is restored.');
+        setLoadingSOS(false);
+        return;
+      }
+
+      sosAPI.trigger(payload)
         .then((res) => {
           if (res.success) {
             setActiveCase(res.case);
+            setDescription('');
             fetchHistory();
           }
         })
@@ -648,7 +809,7 @@ const CitizenDashboard = () => {
         </div>
       )}
 
-      <div className="animate-fade-in" style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: '24px', padding: '24px' }}>
+      <div className="animate-fade-in dashboard-grid citizen-grid">
       
       {/* Left Area: distress Map & immediate SOS triggers */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
@@ -834,6 +995,11 @@ const CitizenDashboard = () => {
                     ? 'Loading...' 
                     : (currentLocation ? `${currentLocation[0].toFixed(5)}°, ${currentLocation[1].toFixed(5)}°` : 'Searching...')}
                 </span>
+                {locationAccuracy !== null && (
+                  <span style={{ display: 'block', fontSize: '9px', color: '#06B6D4', marginTop: '2px', fontWeight: 600 }}>
+                    Accuracy: &plusmn;{Math.round(locationAccuracy)}m ({locationSource.toUpperCase()})
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -868,7 +1034,36 @@ const CitizenDashboard = () => {
           )}
 
           {/* Leaflet GPS map is always rendered */}
-          <div ref={mapContainerRef} style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', zIndex: 1 }} />
+          <div style={{ position: 'relative' }}>
+            <div ref={mapContainerRef} style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', zIndex: 1 }} />
+            
+            {/* Custom Floating GPS Control */}
+            <button 
+              onClick={handleRecenterMap}
+              style={{
+                position: 'absolute',
+                top: '80px',
+                left: '10px',
+                zIndex: 999,
+                width: '34px',
+                height: '34px',
+                background: 'rgba(15, 23, 42, 0.9)',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                borderRadius: '4px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: '#f8fafc',
+                cursor: 'pointer',
+                boxShadow: '0 1px 5px rgba(0,0,0,0.65)',
+                transition: 'all 0.2s',
+              }}
+              className="hover:bg-white/10"
+              title="My Location"
+            >
+              <Navigation size={16} style={{ transform: 'rotate(45deg)' }} />
+            </button>
+          </div>
 
           {/* Context controls based on distress states */}
           {activeCase ? (
@@ -910,27 +1105,54 @@ const CitizenDashboard = () => {
                 </div>
               </div>
             ) : (
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '18px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'rgba(255,255,255,0.02)', padding: '6px 12px', borderRadius: '10px' }}>
-                  <EyeOff size={14} style={{ color: silentSOS ? '#EF4444' : '#64748B' }} />
-                  <span style={{ fontSize: '11px', color: '#CBD5E1', fontWeight: 600 }}>Silent SOS Alert</span>
-                  <input type="checkbox" className="toggle toggle-error toggle-xs" checked={silentSOS} onChange={(e) => setSilentSOS(e.target.checked)} />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '18px', width: '100%' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <label style={{ fontSize: '10.5px', color: '#94A3B8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Distress details (Optional - classified by Gemini AI)
+                  </label>
+                  <textarea
+                    placeholder="Describe your emergency (e.g. chest pain, active fire, major crash with injuries)..."
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    style={{
+                      width: '100%',
+                      height: '54px',
+                      background: 'rgba(255, 255, 255, 0.02)',
+                      border: '1px solid rgba(255, 255, 255, 0.08)',
+                      borderRadius: '8px',
+                      padding: '8px 12px',
+                      color: 'white',
+                      fontSize: '12px',
+                      outline: 'none',
+                      resize: 'none',
+                      transition: 'border 0.2s',
+                      fontFamily: 'inherit'
+                    }}
+                  />
                 </div>
 
-                <button
-                  onClick={startSOSCountdown}
-                  disabled={loadingSOS}
-                  style={{
-                    background: 'linear-gradient(135deg, #EF4444, #B91C1C)',
-                    border: 'none', color: 'white',
-                    fontSize: '12px', fontWeight: 900, cursor: 'pointer',
-                    padding: '10px 24px', borderRadius: '8px',
-                    boxShadow: '0 4px 15px rgba(239,68,68,0.2)', transition: 'all 0.2s',
-                    display: 'flex', alignItems: 'center', gap: '6px'
-                  }}
-                >
-                  <AlertTriangle size={14} /> TRIGGER SOS
-                </button>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '4px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'rgba(255,255,255,0.02)', padding: '6px 12px', borderRadius: '10px' }}>
+                    <EyeOff size={14} style={{ color: silentSOS ? '#EF4444' : '#64748B' }} />
+                    <span style={{ fontSize: '11px', color: '#CBD5E1', fontWeight: 600 }}>Silent SOS Alert</span>
+                    <input type="checkbox" className="toggle toggle-error toggle-xs" checked={silentSOS} onChange={(e) => setSilentSOS(e.target.checked)} />
+                  </div>
+
+                  <button
+                    onClick={startSOSCountdown}
+                    disabled={loadingSOS}
+                    style={{
+                      background: 'linear-gradient(135deg, #EF4444, #B91C1C)',
+                      border: 'none', color: 'white',
+                      fontSize: '12px', fontWeight: 900, cursor: 'pointer',
+                      padding: '10px 24px', borderRadius: '8px',
+                      boxShadow: '0 4px 15px rgba(239,68,68,0.2)', transition: 'all 0.2s',
+                      display: 'flex', alignItems: 'center', gap: '6px'
+                    }}
+                  >
+                    <AlertTriangle size={14} /> TRIGGER SOS
+                  </button>
+                </div>
               </div>
             )}
 

@@ -73,16 +73,16 @@ const BedBooking = () => {
   );
 
   return (
-    <div className="animate-fade-in" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+    <div className="animate-fade-in dashboard-container-padding" style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       
       {/* Title & Search bar */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="bed-booking-header">
         <div>
           <h2 style={{ fontSize: '20px', fontWeight: 900, color: 'white' }}>Emergency Bed Booking Portal</h2>
           <p style={{ fontSize: '12px', color: '#94A3B8', marginTop: '2px' }}>Search and secure hospital beds for yourself or other citizens in distress.</p>
         </div>
 
-        <div style={{ position: 'relative', width: '320px' }}>
+        <div className="bed-booking-search">
           <Search size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: '#64748B' }} />
           <input
             type="text"
@@ -99,7 +99,7 @@ const BedBooking = () => {
       ) : filteredHospitals.length === 0 ? (
         <p style={{ color: '#64748B', textAlign: 'center', padding: '40px' }}>No hospitals found matching your criteria.</p>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: '20px' }}>
+        <div className="hospital-grid">
           {filteredHospitals.map((h) => {
             const genBedsAvail = Math.max(0, (h.hospitalResources?.bedsGeneralTotal || 0) - (h.hospitalResources?.bedsGeneralOccupied || 0));
             const icuBedsAvail = Math.max(0, (h.hospitalResources?.bedsIcuTotal || 0) - (h.hospitalResources?.bedsIcuOccupied || 0));

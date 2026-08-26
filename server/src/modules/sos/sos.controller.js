@@ -3,13 +3,20 @@ import * as sosService from '../../services/sos.service.js';
 import * as geoService from '../../services/geo.service.js';
 
 export const triggerSOS = async (req, res) => {
-  const { longitude, latitude, silent } = req.body;
+  const { longitude, latitude, silent, description, clientRequestId } = req.body;
   if (!longitude || !latitude) {
     return res.status(400).json({ success: false, message: 'Coordinates are required' });
   }
 
   try {
-    const sosCase = await sosService.triggerSOS(req.user._id, longitude, latitude, silent);
+    const sosCase = await sosService.triggerSOS(
+      req.user._id,
+      longitude,
+      latitude,
+      silent,
+      description,
+      clientRequestId
+    );
     res.status(201).json({ success: true, case: sosCase });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

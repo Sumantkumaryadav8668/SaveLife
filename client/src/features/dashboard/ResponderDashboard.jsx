@@ -41,11 +41,19 @@ const ResponderDashboard = () => {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const citizenMarkerRef = useRef(null);
+  const userHasPannedRef = useRef(false);
 
   useEffect(() => {
     fetchActiveCases();
     fetchHistory();
   }, []);
+
+  // Join the selected case room when selectedCase changes
+  useEffect(() => {
+    if (socket && selectedCase) {
+      socket.emit('join', { role: user.role, userId: user.id, sosId: selectedCase._id });
+    }
+  }, [socket, selectedCase, user.id, user.role]);
 
   useEffect(() => {
     if (!socket) return;
@@ -56,20 +64,22 @@ const ResponderDashboard = () => {
 
     const handleSOSUpdate = (data) => {
       fetchActiveCases();
-      if (selectedCase && selectedCase._id === data.caseId) {
-        refreshSelectedCase(data.caseId);
+      const cId = data.case?._id || data.caseId;
+      if (selectedCase && selectedCase._id === cId) {
+        refreshSelectedCase(cId);
       }
     };
 
     const handleSOSResolved = (data) => {
       fetchActiveCases();
       fetchHistory();
-      if (selectedCase && selectedCase._id === data.caseId) {
+      const cId = data.case?._id || data.caseId;
+      if (selectedCase && selectedCase._id === cId) {
         setSelectedCase(null);
       }
     };
 
-    const handleTrackingUpdate = (data) => {
+    const handleCitizenLocation = (data) => {
       if (selectedCase && selectedCase._id === data.caseId && data.coordinates) {
         const latLng = [data.coordinates[1], data.coordinates[0]];
         if (citizenMarkerRef.current) {
@@ -81,20 +91,29 @@ const ResponderDashboard = () => {
       }
     };
 
-    socket.on('sos_alert', handleNewSOS);
-    socket.on('sos_status_update', handleSOSUpdate);
-    socket.on('sos_resolved', handleSOSResolved);
-    socket.on('tracking_update', handleTrackingUpdate);
+    socket.on('sos:created', handleNewSOS);
+    socket.on('sos:accepted', handleSOSUpdate);
+    socket.on('sos:status_updated', handleSOSUpdate);
+    socket.on('sos:resolved', handleSOSResolved);
+    socket.on('citizen:location_updated', handleCitizenLocation);
 
     return () => {
-      socket.off('sos_alert', handleNewSOS);
-      socket.off('sos_status_update', handleSOSUpdate);
-      socket.off('sos_resolved', handleSOSResolved);
-      socket.off('tracking_update', handleTrackingUpdate);
+      socket.off('sos:created', handleNewSOS);
+      socket.off('sos:accepted', handleSOSUpdate);
+      socket.off('sos:status_updated', handleSOSUpdate);
+      socket.off('sos:resolved', handleSOSResolved);
+      socket.off('citizen:location_updated', handleCitizenLocation);
     };
   }, [socket, selectedCase]);
 
   // Leaflet map init
+  // Reset user pan on selection change
+  useEffect(() => {
+    userHasPannedRef.current = false;
+  }, [selectedCase?._id]);
+
+  // Leaflet component trigger
+  const [selectedLat, selectedLng] = selectedCase?.location?.coordinates || [null, null];
   useEffect(() => {
     if (!selectedCase) {
       if (mapRef.current) {
@@ -108,10 +127,23 @@ const ResponderDashboard = () => {
     const latLng = [coordinates[1], coordinates[0]];
 
     if (!mapRef.current && mapContainerRef.current) {
-      mapRef.current = L.map(mapContainerRef.current).setView(latLng, 14);
+      mapRef.current = L.map(mapContainerRef.current, {
+        scrollWheelZoom: true,
+        dragging: true,
+        zoomControl: true,
+        doubleClickZoom: true,
+        touchZoom: true
+      }).setView(latLng, 14);
+
+      mapRef.current.dragging.enable();
+
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; OpenStreetMap contributors',
       }).addTo(mapRef.current);
+
+      mapRef.current.on('dragstart zoomstart', () => {
+        userHasPannedRef.current = true;
+      });
 
       citizenMarkerRef.current = L.marker(latLng, {
         icon: L.divIcon({
@@ -122,12 +154,24 @@ const ResponderDashboard = () => {
         })
       }).addTo(mapRef.current).bindPopup(`<b>Citizen: ${selectedCase.user?.name || 'Emergency signal'}</b>`).openPopup();
     } else if (mapRef.current) {
-      mapRef.current.setView(latLng);
+      if (!userHasPannedRef.current) {
+        mapRef.current.setView(latLng);
+      }
       if (citizenMarkerRef.current) {
         citizenMarkerRef.current.setLatLng(latLng);
       }
     }
-  }, [selectedCase]);
+  }, [selectedCase?._id, selectedLat, selectedLng]);
+
+  // Separate map unmount hook
+  useEffect(() => {
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
+    };
+  }, []);
 
   const fetchActiveCases = async () => {
     setLoadingCases(true);
@@ -223,7 +267,7 @@ const ResponderDashboard = () => {
   };
 
   return (
-    <div className="animate-fade-in" style={{ display: 'grid', gridTemplateColumns: '1fr 480px', gap: '24px', padding: '24px' }}>
+    <div className="animate-fade-in dashboard-grid responder-grid">
       
       {/* Left Column: Active incidents & operational histories */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
@@ -253,26 +297,53 @@ const ResponderDashboard = () => {
               {activeCases.map((c) => {
                 const isSelected = selectedCase?._id === c._id;
                 const isMyAccept = c.assignedResponder?._id === user.entityId || c.assignedResponder === user.entityId;
+                const isP0 = c.priority === 'P0' || c.severity === 'critical';
 
                 return (
                   <div
                     key={c._id}
                     onClick={() => setSelectedCase(c)}
                     style={{
-                      background: isSelected ? 'rgba(99,102,241,0.05)' : 'rgba(255,255,255,0.01)',
-                      border: `1px solid ${isSelected ? '#6366F1' : 'rgba(255,255,255,0.04)'}`,
+                      background: isSelected 
+                        ? 'rgba(99,102,241,0.05)' 
+                        : (isP0 ? 'rgba(239,68,68,0.03)' : 'rgba(255,255,255,0.01)'),
+                      border: `1px solid ${
+                        isSelected 
+                          ? '#6366F1' 
+                          : (isP0 ? 'rgba(239, 68, 68, 0.4)' : 'rgba(255,255,255,0.04)')
+                      }`,
                       borderRadius: '12px', padding: '14px 18px', cursor: 'pointer',
-                      display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '13px'
+                      display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '13px',
+                      boxShadow: isP0 ? '0 0 10px rgba(239,68,68,0.08)' : 'none'
                     }}
                   >
-                    <div>
-                      <span style={{ fontWeight: 700, color: 'white' }}>{c.user?.name || 'Citizen Distress'}</span>
-                      <span style={{ display: 'block', fontSize: '10px', color: '#64748B', marginTop: '2px' }}>Time: {formatDate(c.createdAt)}</span>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                      <div>
+                        <span style={{ fontWeight: 700, color: 'white' }}>{c.user?.name || 'Citizen Distress'}</span>
+                        <span style={{ display: 'block', fontSize: '10px', color: '#94A3B8', marginTop: '2px' }}>
+                          Category: <span style={{ color: '#06B6D4', fontWeight: 600 }}>{c.category?.toUpperCase() || 'UNKNOWN'}</span> | {formatDate(c.createdAt)}
+                        </span>
+                      </div>
+                      <div style={{ textAlign: 'right', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '4px' }}>
+                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                          {isP0 && (
+                            <span 
+                              className="badge badge-error badge-xs animate-pulse" 
+                              style={{ fontWeight: 800, background: '#EF4444', color: 'white', border: 'none', padding: '2px 6px' }}
+                            >
+                              P0 CRITICAL
+                            </span>
+                          )}
+                          <span className={`badge badge-sm ${c.status === 'pending' ? 'badge-error' : 'badge-primary'}`}>{c.status}</span>
+                        </div>
+                        {isMyAccept && <span style={{ display: 'block', fontSize: '9.5px', color: '#10B981', fontWeight: 600 }}>Responding</span>}
+                      </div>
                     </div>
-                    <div style={{ textAlign: 'right' }}>
-                      <span className={`badge badge-sm ${c.status === 'pending' ? 'badge-error' : 'badge-primary'}`}>{c.status}</span>
-                      {isMyAccept && <span style={{ display: 'block', fontSize: '9px', color: '#10B981', marginTop: '4px' }}>Responding</span>}
-                    </div>
+                    {c.description && (
+                      <div style={{ fontSize: '11px', color: '#CBD5E1', fontStyle: 'italic', background: 'rgba(0,0,0,0.15)', padding: '6px 10px', borderRadius: '6px', marginTop: '2px' }}>
+                        "{c.description.length > 60 ? c.description.substring(0, 60) + '...' : c.description}"
+                      </div>
+                    )}
                   </div>
                 );
               })}

@@ -2,21 +2,21 @@ import SOSCase from '../modules/sos/sos-case.model.js';
 import User from '../modules/users/user.model.js';
 import Entity from '../modules/hospitals/entity.model.js';
 import AuditLog from '../modules/admin/audit-log.model.js';
-import { findNearestEntities, calculateDistance } from './geo.service.js';
+import { findNearestEntities } from './geo.service.js';
+import { classifySOS } from './ai.service.js';
+import { sendSMS } from './sms.service.js';
+import { createNotification } from './notification.service.js';
 
 // Map to hold timers for running SOS cases
 // Key: caseId, Value: { repeatTimer, escalationTimer }
 const activeTimers = new Map();
 
-// Helper to notify socket clients (will be set from socket config)
+// Helper to notify socket clients
 let emitToSocket = null;
-export const setSocketEmitter = (emitter) => {
+let ioInstance = null;
+export const setSocketEmitter = (emitter, io) => {
   emitToSocket = emitter;
-};
-
-// Simulated notification helper (FCM / SMS)
-const sendSimulatedSMS = (phone, message) => {
-  console.log(`\n================ SIMULATED SMS ================\nTO: ${phone}\nMESSAGE: ${message}\n================================================\n`);
+  ioInstance = io;
 };
 
 // Helper: Clear case timers
@@ -34,7 +34,29 @@ export const clearCaseTimers = (caseId) => {
   }
 };
 
-// 2. Escalate Silent SOS (called if no responder accepts in 2 minutes)
+// Release active ambulance associated with an SOS Case
+const releaseAssignedAmbulance = async (activeCase) => {
+  try {
+    if (activeCase.assignedAmbulance && activeCase.assignedResponder) {
+      const entity = await Entity.findById(activeCase.assignedResponder).exec();
+      if (entity && entity.type === 'hospital' && entity.hospitalResources?.ambulances) {
+        const ambulance = entity.hospitalResources.ambulances.find(
+          (amb) => amb.ambulanceId === activeCase.assignedAmbulance
+        );
+        if (ambulance) {
+          ambulance.status = 'available';
+          ambulance.activeSOS = null;
+          await entity.save();
+          console.log(`[AMBULANCE] Released ambulance ${activeCase.assignedAmbulance} back to available.`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[AMBULANCE RELEASE ERROR]', err.message);
+  }
+};
+
+// Escalate Silent SOS (called if no responder accepts in 2 minutes)
 const escalateSilentSOS = async (caseId) => {
   try {
     const activeCase = await SOSCase.findById(caseId).populate('user').exec();
@@ -46,7 +68,6 @@ const escalateSilentSOS = async (caseId) => {
     const [lng, lat] = activeCase.location.coordinates;
     const allResponders = await findNearestEntities(lng, lat, null, 5);
     
-    // Get the nearest responder that wasn't the first choice, or let's notify the next-nearest + dispatch default nearest automatically
     const defaultDispatch = allResponders[0]; // nearest team
     const nextNearest = allResponders.slice(1, 3); // next top 2 teams
 
@@ -60,67 +81,127 @@ const escalateSilentSOS = async (caseId) => {
     activeCase.status = 'accepted';
     activeCase.assignedResponder = defaultDispatch._id;
     activeCase.eta = 5; // Default 5 mins ETA on auto-dispatch
+
+    // Link ambulance if hospital
+    if (defaultDispatch.type === 'hospital' && defaultDispatch.hospitalResources?.ambulances) {
+      const ambulance = defaultDispatch.hospitalResources.ambulances.find(amb => amb.status === 'available');
+      if (ambulance) {
+        ambulance.status = 'dispatched';
+        ambulance.activeSOS = activeCase._id;
+        await defaultDispatch.save();
+        activeCase.assignedAmbulance = ambulance.ambulanceId;
+        activeCase.timeline.push({
+          event: 'AMBULANCE_DISPATCHED',
+          details: `Ambulance ${ambulance.ambulanceId} (${ambulance.plateNumber}) dispatched automatically.`,
+          timestamp: new Date()
+        });
+      }
+    }
+
     await activeCase.save();
+
+    // Persist real-time notifications in MongoDB & emit
+    await createNotification(ioInstance, {
+      userId: activeCase.user._id,
+      type: 'sos_update',
+      title: 'Silent SOS Auto-Accepted',
+      message: `Silent SOS auto-dispatched to nearest unit: ${defaultDispatch.name}. ETA: 5 mins.`
+    });
+
+    if (activeCase.assignedAmbulance) {
+      await createNotification(ioInstance, {
+        userId: activeCase.user._id,
+        type: 'sos_update',
+        title: 'Ambulance Assigned',
+        message: `Ambulance unit ${activeCase.assignedAmbulance} has been auto-dispatched.`
+      });
+    }
 
     // Clear timers
     clearCaseTimers(caseId);
 
     if (emitToSocket) {
-      // Notify the dispatcher
-      emitToSocket(`entity:${defaultDispatch._id}:alert`, {
-        event: 'AUTO_DISPATCHED',
-        caseId: activeCase._id,
+      // Alert the dispatch entity room
+      emitToSocket(`entity:${defaultDispatch._id}`, 'sos:created', {
+        case: activeCase,
         userName: activeCase.user.name,
-        userPhone: activeCase.user.phone,
-        location: [lng, lat],
-        silent: true
+        userPhone: activeCase.user.phone
       });
 
       // Alert the next nearest entities
       nextNearest.forEach(entity => {
-        emitToSocket(`entity:${entity._id}:alert`, {
-          event: 'ESCALATION_ALERT',
-          caseId: activeCase._id,
+        emitToSocket(`entity:${entity._id}`, 'sos:created', {
+          case: activeCase,
           userName: activeCase.user.name,
-          userPhone: activeCase.user.phone,
-          location: [lng, lat]
+          userPhone: activeCase.user.phone
         });
       });
 
-      // Notify the user "Help is on the way"
-      emitToSocket(`user:${activeCase.user._id}:sos_update`, {
-        event: 'HELP_ON_THE_WAY',
-        caseId: activeCase._id,
+      // Notify the active case room
+      emitToSocket(`sos:${activeCase._id}`, 'sos:accepted', {
+        case: activeCase,
         responderName: defaultDispatch.name,
         eta: 5
       });
+      emitToSocket(`sos:${activeCase._id}`, 'sos:status_updated', {
+        case: activeCase
+      });
 
       // Update admin maps
-      emitToSocket('admin:sos_update', { event: 'SOS_ESCALATED', case: activeCase });
+      emitToSocket('admin', 'sos:status_updated', { case: activeCase });
     }
   } catch (error) {
     console.error('Error escalating Silent SOS:', error);
   }
 };
 
-// 1. Trigger SOS
-export const triggerSOS = async (userId, longitude, latitude, silent = false) => {
+// Trigger SOS
+export const triggerSOS = async (userId, longitude, latitude, silent = false, description = '', clientRequestId = '') => {
   try {
     const user = await User.findById(userId).exec();
     if (!user) throw new Error('User not found');
 
-    // Find nearest entities: 2 of each type to prevent alert fatigue
-    const nearestHospitals = await findNearestEntities(longitude, latitude, 'hospital', 2);
-    const nearestPolice = await findNearestEntities(longitude, latitude, 'police', 2);
-    const nearestRescue = await findNearestEntities(longitude, latitude, 'rescue', 2);
+    // 1. De-duplication check using clientRequestId
+    if (clientRequestId) {
+      const existingCase = await SOSCase.findOne({ clientRequestId }).exec();
+      if (existingCase) {
+        console.log(`[DEDUPLICATION] SOS Case with clientRequestId ${clientRequestId} already exists. Returning existing case.`);
+        return existingCase;
+      }
+    }
 
-    const allNotified = [...nearestHospitals, ...nearestPolice, ...nearestRescue];
+    // 2. Classify Emergency with Gemini AI triage
+    console.log(`[AI TRIAGE] Classifying SOS description: "${description}"...`);
+    const aiTriage = await classifySOS(description, { longitude, latitude });
+    const { category, severity, priority, reason, confidence } = aiTriage;
+
+    // 3. Selection of appropriate responders based on category & proximity
+    let allNotified = [];
+    if (category === 'medical') {
+      const hospitals = await findNearestEntities(longitude, latitude, 'hospital', 2);
+      const rescue = await findNearestEntities(longitude, latitude, 'rescue', 1);
+      allNotified = [...hospitals, ...rescue];
+    } else if (category === 'fire') {
+      const rescue = await findNearestEntities(longitude, latitude, 'rescue', 2);
+      const police = await findNearestEntities(longitude, latitude, 'police', 1);
+      allNotified = [...rescue, ...police];
+    } else if (category === 'police') {
+      const police = await findNearestEntities(longitude, latitude, 'police', 2);
+      allNotified = [...police];
+    } else {
+      // accident, flood, earthquake, disaster, other
+      const hospitals = await findNearestEntities(longitude, latitude, 'hospital', 2);
+      const police = await findNearestEntities(longitude, latitude, 'police', 1);
+      const rescue = await findNearestEntities(longitude, latitude, 'rescue', 1);
+      allNotified = [...hospitals, ...police, ...rescue];
+    }
+
     const notifiedEntities = allNotified.map(entity => ({
       entity: entity._id,
       notifiedAt: new Date()
     }));
 
-    // Create SOS Case
+    // 4. Create SOS Case
     const newCase = new SOSCase({
       user: userId,
       location: {
@@ -128,12 +209,20 @@ export const triggerSOS = async (userId, longitude, latitude, silent = false) =>
         coordinates: [longitude, latitude]
       },
       silent,
+      clientRequestId,
+      description,
+      category,
+      severity,
+      priority,
+      aiAnalysis: reason,
+      aiConfidence: confidence,
+      aiProcessedAt: new Date(),
       notifiedEntities,
       status: 'pending',
       timeline: [
         {
           event: 'SOS_TRIGGERED',
-          details: `SOS triggered by ${user.name}. Type: ${silent ? 'Silent' : 'Standard'}.`,
+          details: `SOS triggered by ${user.name}. Category: ${category}, Severity: ${severity}, Priority: ${priority}.`,
           timestamp: new Date()
         }
       ]
@@ -141,38 +230,42 @@ export const triggerSOS = async (userId, longitude, latitude, silent = false) =>
 
     await newCase.save();
 
-    // Notify emergency contacts
+    // Persist real-time notifications in MongoDB & emit
+    await createNotification(ioInstance, {
+      userId: userId,
+      type: 'sos_alert',
+      title: 'SOS Registered',
+      message: `Your SOS emergency distress signal has been registered (AI Category: ${category.toUpperCase()}, Priority: ${priority}). Nearest emergency units are being matched.`
+    });
+
+    // 5. Notify emergency contacts via real SMS abstraction
     const gmapsLink = `https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}`;
     user.emergencyContacts.forEach(contact => {
-      const msg = `EMERGENCY ALERT: ${user.name} has triggered an SOS! Live location: ${gmapsLink}. Help is being dispatched.`;
-      sendSimulatedSMS(contact.phone, msg);
+      const msg = `EMERGENCY ALERT: ${user.name} has triggered an SOS! Live location: ${gmapsLink}. Severity: ${severity.toUpperCase()}.`;
+      sendSMS(contact.phone, msg).catch(err => console.error('Failed to send SMS to emergency contact:', err.message));
     });
 
     // Setup active timers structure for this case
     activeTimers.set(newCase._id.toString(), {});
 
-    // Broadcast to Sockets
+    // 6. Broadcast to Sockets via Rooms
     if (emitToSocket) {
-      // Alert nearest responders immediately
+      // Alert appropriate nearest responders
       allNotified.forEach(entity => {
-        emitToSocket(`entity:${entity._id}:alert`, {
-          event: 'NEW_SOS_ALERT',
-          caseId: newCase._id,
+        emitToSocket(`entity:${entity._id}`, 'sos:created', {
+          case: newCase,
           userName: user.name,
-          userPhone: user.phone,
-          location: [longitude, latitude],
-          silent
+          userPhone: user.phone
         });
       });
 
-      // Update active maps
-      emitToSocket('admin:sos_update', { event: 'SOS_TRIGGERED', case: newCase });
+      // Update active maps in admin dashboard
+      emitToSocket('admin', 'sos:created', { case: newCase });
     }
 
     if (silent) {
-      // For Silent SOS: Team has 2 minutes to confirm
-      // Pick the single closest entity to assign initially
-      const primaryResponder = allNotified[0]; // Nearest entity
+      // Silent SOS Route auto-escalation check
+      const primaryResponder = allNotified[0];
       if (primaryResponder) {
         newCase.timeline.push({
           event: 'SILENT_ASSIGNMENT',
@@ -188,7 +281,7 @@ export const triggerSOS = async (userId, longitude, latitude, silent = false) =>
         activeTimers.get(newCase._id.toString()).escalationTimer = timerId;
       }
     } else {
-      // Standard SOS: Repeat alert every 5 minutes until dispatch acceptance
+      // Standard SOS: Repeat alert every 5 minutes until accepted
       const repeatTimerId = setInterval(async () => {
         const freshCase = await SOSCase.findById(newCase._id).exec();
         if (freshCase && freshCase.status === 'pending') {
@@ -202,21 +295,17 @@ export const triggerSOS = async (userId, longitude, latitude, silent = false) =>
 
           if (emitToSocket) {
             allNotified.forEach(entity => {
-              emitToSocket(`entity:${entity._id}:alert`, {
-                event: 'REPEATED_SOS_ALERT',
-                caseId: newCase._id,
+              emitToSocket(`entity:${entity._id}`, 'sos:created', {
+                case: freshCase,
                 userName: user.name,
-                userPhone: user.phone,
-                location: [longitude, latitude],
-                silent: false
+                userPhone: user.phone
               });
             });
           }
         } else {
-          // Case resolved or accepted, clear timer
           clearCaseTimers(newCase._id.toString());
         }
-      }, 5 * 60 * 1000); // 5 minutes
+      }, 5 * 60 * 1000);
 
       activeTimers.get(newCase._id.toString()).repeatTimer = repeatTimerId;
     }
@@ -228,7 +317,7 @@ export const triggerSOS = async (userId, longitude, latitude, silent = false) =>
   }
 };
 
-// 3. Accept SOS Case
+// Accept SOS Case
 export const acceptSOS = async (caseId, responderUserId, entityId, eta) => {
   try {
     const activeCase = await SOSCase.findById(caseId).populate('user').exec();
@@ -248,22 +337,57 @@ export const acceptSOS = async (caseId, responderUserId, entityId, eta) => {
       timestamp: new Date()
     });
 
+    // Find and assign available ambulance if entity is hospital
+    if (entity.type === 'hospital' && entity.hospitalResources?.ambulances) {
+      const ambulance = entity.hospitalResources.ambulances.find(amb => amb.status === 'available');
+      if (ambulance) {
+        ambulance.status = 'dispatched';
+        ambulance.activeSOS = activeCase._id;
+        await entity.save();
+        
+        activeCase.assignedAmbulance = ambulance.ambulanceId;
+        activeCase.timeline.push({
+          event: 'AMBULANCE_DISPATCHED',
+          details: `Ambulance ${ambulance.ambulanceId} (${ambulance.plateNumber}) dispatched from ${entity.name}.`,
+          timestamp: new Date()
+        });
+      }
+    }
+
     await activeCase.save();
 
-    // Clear any timers
+    // Persist real-time notifications in MongoDB & emit
+    await createNotification(ioInstance, {
+      userId: activeCase.user._id,
+      type: 'sos_update',
+      title: 'SOS Emergency Accepted',
+      message: `Your SOS has been accepted by ${entity.name}. Responder ${responder.name} is en route (ETA: ${activeCase.eta} minutes).`
+    });
+
+    if (activeCase.assignedAmbulance) {
+      await createNotification(ioInstance, {
+        userId: activeCase.user._id,
+        type: 'sos_update',
+        title: 'Ambulance Dispatched',
+        message: `Ambulance unit ${activeCase.assignedAmbulance} has been assigned and dispatched from ${entity.name}.`
+      });
+    }
+
+    // Clear timers
     clearCaseTimers(caseId);
 
-    // Notify User and update Socket clients
+    // Notify rooms via socket
     if (emitToSocket) {
-      emitToSocket(`user:${activeCase.user._id}:sos_update`, {
-        event: 'HELP_ON_THE_WAY',
-        caseId: activeCase._id,
+      emitToSocket(`sos:${activeCase._id}`, 'sos:accepted', {
+        case: activeCase,
         responderName: entity.name,
         responderPhone: entity.contactNumber,
         eta: activeCase.eta
       });
-
-      emitToSocket('admin:sos_update', { event: 'SOS_ACCEPTED', case: activeCase });
+      emitToSocket(`sos:${activeCase._id}`, 'sos:status_updated', {
+        case: activeCase
+      });
+      emitToSocket('admin', 'sos:status_updated', { case: activeCase });
     }
 
     return activeCase;
@@ -273,7 +397,7 @@ export const acceptSOS = async (caseId, responderUserId, entityId, eta) => {
   }
 };
 
-// 4. Resolve SOS Case
+// Resolve SOS Case
 export const resolveSOS = async (caseId, feedbackRating = 5, feedbackComment = '') => {
   try {
     const activeCase = await SOSCase.findById(caseId).populate('user').exec();
@@ -294,14 +418,24 @@ export const resolveSOS = async (caseId, feedbackRating = 5, feedbackComment = '
       };
     }
 
+    // Release assigned ambulance back to fleet
+    await releaseAssignedAmbulance(activeCase);
+
     await activeCase.save();
 
+    // Persist real-time notifications in MongoDB & emit
+    await createNotification(ioInstance, {
+      userId: activeCase.user._id,
+      type: 'sos_resolved',
+      title: 'Emergency Resolved',
+      message: 'Your active emergency SOS case has been successfully closed and resolved.'
+    });
+
     if (emitToSocket) {
-      emitToSocket(`user:${activeCase.user._id}:sos_update`, {
-        event: 'CASE_RESOLVED',
-        caseId: activeCase._id
+      emitToSocket(`sos:${activeCase._id}`, 'sos:resolved', {
+        case: activeCase
       });
-      emitToSocket('admin:sos_update', { event: 'SOS_RESOLVED', case: activeCase });
+      emitToSocket('admin', 'sos:status_updated', { case: activeCase });
     }
 
     return activeCase;
@@ -311,7 +445,7 @@ export const resolveSOS = async (caseId, feedbackRating = 5, feedbackComment = '
   }
 };
 
-// 5. Flag False Alarm & Handle Abuse Rules
+// Flag False Alarm & Handle Abuse Rules
 export const flagFalseAlarm = async (caseId, flaggerUserId, comment = '') => {
   try {
     const activeCase = await SOSCase.findById(caseId).populate('user').exec();
@@ -329,6 +463,9 @@ export const flagFalseAlarm = async (caseId, flaggerUserId, comment = '') => {
       timestamp: new Date()
     });
 
+    // Release ambulance
+    await releaseAssignedAmbulance(activeCase);
+
     await activeCase.save();
 
     // Clear timers
@@ -340,11 +477,7 @@ export const flagFalseAlarm = async (caseId, flaggerUserId, comment = '') => {
 
     let systemAction = 'none';
     let durationHours = 0;
-    const systemAdmin = await User.findOne({ role: 'system_admin' }).exec() || { _id: flaggerUserId }; // fallback
 
-    // Abuse Prevention Logic:
-    // 3 False alarms -> Suspend for 24 hours
-    // 5 False alarms -> Permanently blocked
     if (distressUser.falseAlarmsCount >= 5) {
       distressUser.status = 'blocked';
       systemAction = 'PERMANENT_BLOCK';
@@ -353,7 +486,7 @@ export const flagFalseAlarm = async (caseId, flaggerUserId, comment = '') => {
         action: 'USER_BLOCK',
         performedBy: flaggerUserId,
         targetUser: distressUser._id,
-        details: `Permanently blocked user ${distressUser.name} (${distressUser.email}) after reaching ${distressUser.falseAlarmsCount} false alarms.`
+        details: `Permanently blocked user ${distressUser.name} after reaching ${distressUser.falseAlarmsCount} false alarms.`
       });
     } else if (distressUser.falseAlarmsCount >= 3) {
       distressUser.status = 'suspended';
@@ -365,20 +498,27 @@ export const flagFalseAlarm = async (caseId, flaggerUserId, comment = '') => {
         action: 'USER_SUSPENSION',
         performedBy: flaggerUserId,
         targetUser: distressUser._id,
-        details: `Suspended user ${distressUser.name} (${distressUser.email}) for 24 hours after reaching ${distressUser.falseAlarmsCount} false alarms.`
+        details: `Suspended user ${distressUser.name} for 24 hours after reaching ${distressUser.falseAlarmsCount} false alarms.`
       });
     }
 
     await distressUser.save();
 
+    // Persist real-time notifications in MongoDB & emit
+    await createNotification(ioInstance, {
+      userId: activeCase.user._id,
+      type: 'sos_update',
+      title: 'SOS Marked False Alarm',
+      message: `Your SOS case has been flagged as a false alarm. System Action: ${systemAction}. False Alarm Count: ${distressUser.falseAlarmsCount}`
+    });
+
     if (emitToSocket) {
-      emitToSocket(`user:${activeCase.user._id}:sos_update`, {
-        event: 'CASE_MARKED_FALSE_ALARM',
-        caseId: activeCase._id,
+      emitToSocket(`sos:${activeCase._id}`, 'sos:status_updated', {
+        case: activeCase,
         systemAction,
         suspensionUntil: distressUser.suspensionUntil
       });
-      emitToSocket('admin:sos_update', { event: 'SOS_FALSE_ALARM', case: activeCase });
+      emitToSocket('admin', 'sos:status_updated', { case: activeCase });
     }
 
     return { activeCase, userStatus: distressUser.status, falseAlarmsCount: distressUser.falseAlarmsCount };

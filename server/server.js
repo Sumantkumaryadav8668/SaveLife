@@ -30,6 +30,9 @@ const startServer = async () => {
       await seedData(false);
     }
 
+    // Bind io instance to app
+    app.set('io', io);
+
     // 3. Attach real-time socket handlers
     handleSockets(io);
 

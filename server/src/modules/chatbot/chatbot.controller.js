@@ -1,99 +1,166 @@
+import { queryChatbot } from '../../services/ai.service.js';
 import SupportTicket from './support-ticket.model.js';
 
-const faqResponses = [
-  {
-    keywords: ['sos', 'trigger', 'help', 'emergency'],
-    response: 'To trigger an SOS, press the large floating red "SOS" button available at the bottom-right corner of any page. You can trigger a standard alert (sends to nearest police, hospital, and rescue) or a Silent SOS (dispatched quietly with auto-escalation rules).'
-  },
-  {
-    keywords: ['contact', 'family', 'friend', 'contacts'],
-    response: 'You can add up to 5 emergency contacts in your profile settings or dashboard. Whenever you trigger an SOS, these contacts automatically receive an SMS notification with your exact live location details.'
-  },
-  {
-    keywords: ['track', 'gps', 'privacy', 'map'],
-    response: 'To protect your privacy, RapidAid only tracks your live location while an active SOS case is open. Once the case is accepted or resolved, live location sharing stops completely.'
-  },
-  {
-    keywords: ['profile', 'verify', 'id', 'identity', 'aadhaar'],
-    response: 'Go to your dashboard profile section to upload your Government ID (e.g. Aadhaar Card). Once a system admin reviews and verifies your ID, it speeds up responder verification and ensures abuse protection checks.'
-  },
-  {
-    keywords: ['hi', 'hello', 'hey', 'start'],
-    response: 'Hello! I am RapidBot, your emergency platform assistant. How can I help you today? (Try asking: "How do I send an SOS?", "How to add contacts?", or say "talk to human support").'
-  }
-];
+// Static FAQ fallback chatbot responder
+const getFAQResponse = (message = '') => {
+  const msg = message.toLowerCase().trim();
 
-export const queryBot = async (req, res) => {
-  const { message } = req.body;
+  if (
+    msg.includes('how to trigger') || 
+    msg.includes('how do i trigger') || 
+    msg.includes('trigger sos') ||
+    msg.includes('silent sos')
+  ) {
+    return "To trigger an SOS: Click the red floating 'SOS' button at the bottom-right of your citizen dashboard or press 'TRIGGER SOS' on the console. Standard SOS alerts nearest stations and repeats every 5 minutes. Silent SOS dispatches quietly and auto-escalates in 2 minutes if not accepted.";
+  }
+
+  if (
+    msg.includes('privacy') || 
+    msg.includes('gps') || 
+    msg.includes('track') || 
+    msg.includes('location')
+  ) {
+    return "Your GPS location is only tracked during an active SOS distress case. Tracking terminates immediately once the case is resolved to protect citizen privacy.";
+  }
+
+  if (
+    msg.includes('contact') || 
+    msg.includes('number') || 
+    msg.includes('family') || 
+    msg.includes('friend')
+  ) {
+    return "You can add up to 5 emergency contacts in the Citizen Dashboard. When you trigger an SOS, they will receive automated SMS alerts containing your live location.";
+  }
+
+  if (
+    msg.includes('verify') || 
+    msg.includes('aadhaar') || 
+    msg.includes('identity') || 
+    msg.includes('id card')
+  ) {
+    return "To prevent false alarms, citizens must upload a government ID scan (e.g. Aadhaar). System admins review and verify profiles to ensure platform security.";
+  }
+
+  return "I am RapidBot, your emergency guide. If you are facing an active emergency, please trigger the red SOS button immediately or dial 100/108. For safety or platform questions, feel free to ask.";
+};
+
+const checkDistressWords = (text) => {
+  const distressWords = ['die', 'kill', 'suicide', 'bleeding', 'attack', 'weapon', 'unconscious', 'heart attack', 'choking'];
+  const query = (text || '').toLowerCase();
+  return distressWords.some(word => query.includes(word));
+};
+
+/**
+ * Handle chatbot query message
+ */
+export const getMessageResponse = async (req, res) => {
+  const { message, history } = req.body;
+
   if (!message) {
     return res.status(400).json({ success: false, message: 'Message is required' });
   }
 
-  const query = message.toLowerCase().trim();
-
-  if (query.includes('human') || query.includes('support') || query.includes('escalate') || query.includes('agent') || query.includes('talk to')) {
-    return res.json({
-      success: true,
-      botResponse: 'Escalating this request to a human operator... Generating support ticket now.',
-      shouldEscalate: true
-    });
-  }
-
-  let matchedResponse = 'I am not sure I understand that. Try asking about "SOS", "Emergency Contacts", "GPS Privacy", "ID Verification", or say "talk to human support" to escalate.';
-
-  for (const item of faqResponses) {
-    if (item.keywords.some(keyword => query.includes(keyword))) {
-      matchedResponse = item.response;
-      break;
-    }
-  }
-
-  res.json({
-    success: true,
-    botResponse: matchedResponse,
-    shouldEscalate: false
-  });
-};
-
-export const escalateTicket = async (req, res) => {
-  const { initialMessage } = req.body;
+  const shouldEscalate = checkDistressWords(message);
 
   try {
-    const newTicket = new SupportTicket({
+    // 1. Try querying Gemini LLM
+    const response = await queryChatbot(message, history || []);
+
+    if (response) {
+      return res.json({ 
+        success: true, 
+        response, 
+        botResponse: response,
+        shouldEscalate
+      });
+    }
+
+    // 2. Fall back to static FAQ rule matcher
+    const fallbackResponse = getFAQResponse(message);
+    res.json({ 
+      success: true, 
+      response: fallbackResponse, 
+      botResponse: fallbackResponse,
+      shouldEscalate
+    });
+  } catch (error) {
+    console.error('[Chatbot Controller] Error:', error.message);
+    const fallbackResponse = getFAQResponse(message);
+    res.json({ 
+      success: true, 
+      response: fallbackResponse, 
+      botResponse: fallbackResponse,
+      shouldEscalate
+    });
+  }
+};
+
+// Map queryBot to getMessageResponse for backward compatibility in routing
+export const queryBot = getMessageResponse;
+
+/**
+ * Escalate conversation to human support ticket
+ */
+export const escalateTicket = async (req, res) => {
+  const { subject, messages, initialMessage } = req.body;
+
+  try {
+    let ticketMessages = messages || [];
+    if (initialMessage && ticketMessages.length === 0) {
+      ticketMessages = [{ sender: 'user', text: initialMessage }];
+    }
+
+    const ticket = new SupportTicket({
       user: req.user._id,
-      messages: [
-        { sender: 'user', text: initialMessage || 'Requesting human support escalations' },
-        { sender: 'system', text: 'Chatbot escalated this issue. System Administrator has been notified.' }
-      ]
+      subject: subject || 'Chatbot Human Escalation',
+      messages: ticketMessages
     });
 
-    await newTicket.save();
-    res.status(201).json({ success: true, ticket: newTicket });
+    await ticket.save();
+    res.status(201).json({ success: true, message: 'Support ticket opened successfully.', ticket });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
+/**
+ * Retrieve all support tickets (Admin Only)
+ */
 export const getTickets = async (req, res) => {
   try {
-    const tickets = await SupportTicket.find().populate('user', 'name email role phone').sort({ createdAt: -1 }).exec();
-    res.json({ success: true, tickets });
+    const tickets = await SupportTicket.find({})
+      .populate('user', 'name email phone')
+      .sort({ createdAt: -1 })
+      .exec();
+
+    const mappedTickets = tickets.map(t => {
+      const obj = t.toObject();
+      obj.initialMessage = obj.initialMessage || obj.messages?.[0]?.text || '';
+      return obj;
+    });
+
+    res.json({ success: true, tickets: mappedTickets });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
+/**
+ * Mark support ticket as resolved (Admin Only)
+ */
 export const resolveTicket = async (req, res) => {
   const { id } = req.params;
+
   try {
     const ticket = await SupportTicket.findById(id).exec();
     if (!ticket) {
-      return res.status(404).json({ success: false, message: 'Ticket not found' });
+      return res.status(404).json({ success: false, message: 'Support ticket not found.' });
     }
+
     ticket.status = 'resolved';
-    ticket.messages.push({ sender: 'system', text: 'This support ticket has been resolved.' });
     await ticket.save();
-    res.json({ success: true, ticket });
+
+    res.json({ success: true, message: 'Support ticket resolved successfully.', ticket });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

@@ -210,11 +210,11 @@ const AdminDashboard = () => {
   );
 
   return (
-    <div className="animate-fade-in" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '24px' }}>
+    <div className="animate-fade-in dashboard-container-padding" style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
       
       {/* Top Summaries Header */}
       {analytics && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px' }}>
+        <div className="admin-stats-grid">
           
           <div className="glass-panel stat-card stat-glow-indigo">
             <span style={{ fontSize: '11px', color: '#94A3B8', fontWeight: 600 }}>Total Incidents Logged</span>
@@ -294,7 +294,7 @@ const AdminDashboard = () => {
             {loadingAnalytics ? (
               <div style={{ textAlign: 'center', padding: '60px' }}><span className="loading loading-spinner loading-md"></span></div>
             ) : analytics ? (
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '20px' }}>
+              <div className="dashboard-grid admin-grid">
                 
                 <div className="glass-panel" style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                   <h4 style={{ fontSize: '14px', color: 'white', fontWeight: 700 }}>Distress Case Frequency</h4>
@@ -481,7 +481,7 @@ const AdminDashboard = () => {
                         <span style={{ fontSize: '12px', fontWeight: 700, color: 'white' }}>Ref: {t._id.slice(-6)}</span>
                         <span className={`badge badge-sm ${t.status === 'open' ? 'badge-error' : 'badge-success'}`}>{t.status}</span>
                       </div>
-                      <p style={{ fontSize: '12px', color: '#CBD5E1', marginTop: '4px' }}><b>Query:</b> "{t.initialMessage}"</p>
+                      <p style={{ fontSize: '12px', color: '#CBD5E1', marginTop: '4px' }}><b>Query:</b> "{t.initialMessage || t.messages?.[0]?.text || ''}"</p>
                     </div>
                     {t.status === 'open' && (
                       <button onClick={() => handleResolveTicket(t._id)} style={{ background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.15)', color: '#10B981', borderRadius: '6px', padding: '6px 12px', fontSize: '11px', cursor: 'pointer' }}>Resolve</button>

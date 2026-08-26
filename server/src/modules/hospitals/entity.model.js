@@ -49,11 +49,12 @@ const EntitySchema = new mongoose.Schema({
       {
         ambulanceId: { type: String, required: true },
         plateNumber: { type: String, required: true },
-        status: { type: String, enum: ['available', 'dispatched'], default: 'available' },
+        status: { type: String, enum: ['available', 'dispatched', 'en_route', 'arrived', 'transporting', 'completed', 'offline'], default: 'available' },
         location: {
           lat: { type: Number, default: 0 },
           lng: { type: Number, default: 0 }
-        }
+        },
+        activeSOS: { type: mongoose.Schema.Types.ObjectId, ref: 'SOSCase', default: null }
       }
     ],
     doctors: [

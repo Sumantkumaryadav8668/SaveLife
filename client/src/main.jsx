@@ -4,6 +4,15 @@ import './index.css';
 import App from './App.jsx';
 import { AuthProvider } from './context/AuthContext.jsx';
 import { SocketProvider } from './context/SocketContext.jsx';
+import L from 'leaflet';
+
+// Fix Leaflet zoom scroll direction inversion globally
+const originalGetWheelDelta = L.DomEvent.getWheelDelta;
+if (originalGetWheelDelta) {
+  L.DomEvent.getWheelDelta = (e) => {
+    return -originalGetWheelDelta(e);
+  };
+}
 
 // Register Service Worker in production only, and actively clean up in development
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {

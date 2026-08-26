@@ -31,8 +31,8 @@ export const useNotifications = () => {
       setNotifications((prev) => [notification, ...prev]);
       setUnreadCount((prev) => prev + 1);
     };
-    socket.on('new_notification', handler);
-    return () => socket.off('new_notification', handler);
+    socket.on('notification:new', handler);
+    return () => socket.off('notification:new', handler);
   }, [socket]);
 
   const markRead = async (id) => {

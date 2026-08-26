@@ -27,6 +27,46 @@ const SOSCaseSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  clientRequestId: {
+    type: String,
+    default: null,
+    index: true
+  },
+  description: {
+    type: String,
+    default: ''
+  },
+  category: {
+    type: String,
+    enum: ['medical', 'accident', 'fire', 'police', 'flood', 'earthquake', 'disaster', 'other'],
+    default: 'other'
+  },
+  severity: {
+    type: String,
+    enum: ['critical', 'high', 'medium', 'low'],
+    default: 'medium'
+  },
+  priority: {
+    type: String,
+    enum: ['P0', 'P1', 'P2', 'P3'],
+    default: 'P2'
+  },
+  aiAnalysis: {
+    type: String,
+    default: ''
+  },
+  aiConfidence: {
+    type: Number,
+    default: 0
+  },
+  aiProcessedAt: {
+    type: Date,
+    default: null
+  },
+  assignedAmbulance: {
+    type: String,
+    default: null
+  },
   // Responders matches and notifications
   notifiedEntities: [
     {

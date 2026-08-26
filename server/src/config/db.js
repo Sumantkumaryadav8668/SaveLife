@@ -14,6 +14,10 @@ const connectDB = async () => {
     console.log(`MongoDB Connected successfully...`);
     return conn;
   } catch (err) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error(`[DB PRODUCTION ERROR] Connection failed: ${err.message}`);
+      throw err;
+    }
     console.warn(`\n[DB FALLBACK] Standard connection failed: ${err.message}`);
     console.log(`[DB FALLBACK] Starting an in-memory MongoDB Server instead...`);
     

@@ -10,7 +10,7 @@ export const createNotification = async (io, { userId, type, title, message, met
 
   // Emit real-time event to the specific user's room
   if (io) {
-    io.to(`user_${userId}`).emit('new_notification', {
+    io.to(`user:${userId}`).emit('notification:new', {
       _id: notification._id,
       type,
       title,
