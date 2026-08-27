@@ -117,6 +117,7 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
             latitude: lat,
             longitude: lng,
             accuracy: acc,
+            permissionState: 'granted',
             loading: false,
             error: ''
           }));
@@ -185,35 +186,34 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
     stopWatching();
 
     console.log('[GPS] Refresh GPS clicked. Checking current permission state...');
+    let currentPermState = 'prompt';
 
     if (navigator.permissions && navigator.permissions.query) {
       try {
         const permissionStatus = await navigator.permissions.query({ name: 'geolocation' });
         console.log('[GPS] Permission check before Refresh:', permissionStatus.state);
-        
-        setLocationState(prev => ({
-          ...prev,
-          permissionState: permissionStatus.state
-        }));
-
-        if (permissionStatus.state === 'denied') {
-          setLocationState(prev => ({
-            ...prev,
-            latitude: null,
-            longitude: null,
-            accuracy: null,
-            loading: false,
-            error: 'Location permission is blocked for this site. Enable Location permission in your browser Site Settings, then click Refresh GPS.'
-          }));
-          return;
-        }
+        currentPermState = permissionStatus.state;
       } catch (err) {
         console.error('Error checking permission state:', err);
       }
     }
 
+    if (currentPermState === 'denied') {
+      setLocationState(prev => ({
+        ...prev,
+        permissionState: 'denied',
+        latitude: null,
+        longitude: null,
+        accuracy: null,
+        loading: false,
+        error: 'Location permission is blocked for this site. Enable Location permission in your browser Site Settings, then click Refresh GPS.'
+      }));
+      return;
+    }
+
     setLocationState(prev => ({
       ...prev,
+      permissionState: currentPermState,
       loading: true,
       error: ''
     }));
@@ -232,6 +232,7 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
             latitude: lat,
             longitude: lng,
             accuracy: acc,
+            permissionState: 'granted',
             loading: false,
             error: ''
           }));
@@ -256,6 +257,7 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
               error: reason
             }));
           } else {
+            let nextPermState = currentPermState;
             if (err.code === 2 || err.code === err.POSITION_UNAVAILABLE) {
               reason = 'Unable to determine your current location. Please check your GPS/location settings.';
             } else if (err.code === 3 || err.code === err.TIMEOUT) {
@@ -263,6 +265,7 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
             }
             setLocationState(prev => ({
               ...prev,
+              permissionState: nextPermState,
               loading: false,
               error: reason
             }));
@@ -292,25 +295,24 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
           permissionStatusRef.current = permissionStatus;
           
           console.log('[GPS] Initial Permission query:', permissionStatus.state);
-          setLocationState(prev => ({
-            ...prev,
-            permissionState: permissionStatus.state
-          }));
-
+          
           const handlePermissionStatusChange = () => {
             if (!active) return;
             console.log('[GPS] Permission changed:', permissionStatus.state);
-            setLocationState(prev => ({
-              ...prev,
-              permissionState: permissionStatus.state
-            }));
 
             if (permissionStatus.state === 'granted') {
+              setLocationState(prev => ({
+                ...prev,
+                permissionState: 'granted',
+                error: '',
+                loading: true
+              }));
               startWatching(true);
             } else if (permissionStatus.state === 'denied') {
               stopWatching();
               setLocationState(prev => ({
                 ...prev,
+                permissionState: 'denied',
                 latitude: null,
                 longitude: null,
                 accuracy: null,
@@ -322,6 +324,7 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
               stopWatching();
               setLocationState(prev => ({
                 ...prev,
+                permissionState: 'prompt',
                 latitude: null,
                 longitude: null,
                 accuracy: null,
@@ -335,11 +338,16 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
 
           // Initial routing based on permission state
           if (permissionStatus.state === 'granted') {
+            setLocationState(prev => ({
+              ...prev,
+              permissionState: 'granted'
+            }));
             startWatching(true);
           } else if (permissionStatus.state === 'denied') {
             stopWatching();
             setLocationState(prev => ({
               ...prev,
+              permissionState: 'denied',
               latitude: null,
               longitude: null,
               accuracy: null,
@@ -351,6 +359,7 @@ export const useDeviceLocation = (activeCase = null, socket = null, userId = nul
             stopWatching();
             setLocationState(prev => ({
               ...prev,
+              permissionState: 'prompt',
               loading: false,
               error: ''
             }));
