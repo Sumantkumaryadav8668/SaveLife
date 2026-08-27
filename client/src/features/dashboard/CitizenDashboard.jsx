@@ -49,6 +49,32 @@ const CitizenDashboard = () => {
       : locationState.locality || locationState.city)
     : (locationState.state || locationState.country || '');
 
+  // Construct a formatted locality/city area name dynamically from the state
+  const displayLocality = () => {
+    if (locationState.loading && !locationState.locality && !locationState.city) {
+      return 'Pinpointing...';
+    }
+    if (locationState.permissionDenied) {
+      return 'Location permission denied';
+    }
+    if (locationState.error && !locationState.latitude) {
+      return 'Unable to determine location';
+    }
+    
+    const parts = [];
+    if (locationState.locality) parts.push(locationState.locality);
+    if (locationState.city) parts.push(locationState.city);
+    else if (locationState.state) parts.push(locationState.state);
+    
+    if (parts.length > 0) {
+      return parts.join(', ');
+    }
+    
+    if (locationState.country) return locationState.country;
+    
+    return 'Fetching Location...';
+  };
+
   // Welcome location notification states
   const [welcomeToast, setWelcomeToast] = useState(null);
   const welcomeShownRef = useRef(false);
@@ -386,7 +412,7 @@ const CitizenDashboard = () => {
         zoomControl: true,
         doubleClickZoom: true,
         touchZoom: true
-      }).setView(latLng, 14);
+      }).setView(latLng, 15);
 
       mapRef.current.dragging.enable();
 
