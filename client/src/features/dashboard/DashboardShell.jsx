@@ -38,7 +38,7 @@ const DashboardShell = () => {
 
   // Dev mode service worker unregistration helper on mount
   useEffect(() => {
-    if ('serviceWorker' in navigator) {
+    if (!import.meta.env.PROD && 'serviceWorker' in navigator) {
       navigator.serviceWorker.getRegistrations().then((registrations) => {
         for (const r of registrations) {
           r.unregister().then((success) => {
