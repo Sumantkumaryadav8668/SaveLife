@@ -487,7 +487,12 @@ const CitizenDashboard = () => {
 
     if (!coordinates) {
       if (mapRef.current) {
-        mapRef.current.remove();
+        try {
+          mapRef.current.off();
+          mapRef.current.remove();
+        } catch (e) {
+          console.error('Error removing Leaflet map instance:', e);
+        }
         mapRef.current = null;
         citizenMarkerRef.current = null;
         accuracyCircleRef.current = null;
@@ -498,6 +503,11 @@ const CitizenDashboard = () => {
     const latLng = [coordinates[1], coordinates[0]];
 
     if (!mapRef.current && mapContainerRef.current) {
+      // Clear any pre-existing Leaflet residual marker/id from the DOM element
+      if (mapContainerRef.current._leaflet_id) {
+        delete mapContainerRef.current._leaflet_id;
+      }
+
       mapRef.current = L.map(mapContainerRef.current, {
         scrollWheelZoom: true,
         dragging: true,
@@ -614,7 +624,12 @@ const CitizenDashboard = () => {
   useEffect(() => {
     return () => {
       if (mapRef.current) {
-        mapRef.current.remove();
+        try {
+          mapRef.current.off();
+          mapRef.current.remove();
+        } catch (e) {
+          console.error('Error in map unmount cleanup:', e);
+        }
         mapRef.current = null;
       }
     };
@@ -1226,7 +1241,7 @@ const CitizenDashboard = () => {
           {/* Leaflet GPS map is only initialized and rendered when valid coordinates are available */}
           <div style={{ position: 'relative' }}>
             {!(locationState.latitude && locationState.longitude) && !activeCase?.location?.coordinates ? (
-              <div style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(15, 23, 42, 0.4)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '24px', textAlign: 'center' }}>
+              <div key="map-placeholder" style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(15, 23, 42, 0.4)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '24px', textAlign: 'center' }}>
                 <MapPin size={40} color="#6366F1" style={{ opacity: 0.6, animation: 'pulse 2s infinite' }} />
                 <span style={{ fontSize: '14px', color: '#94A3B8', fontWeight: 500 }}>
                   {locationState.permissionDenied 
@@ -1238,7 +1253,7 @@ const CitizenDashboard = () => {
               </div>
             ) : (
               <>
-                <div ref={mapContainerRef} style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', zIndex: 1 }} />
+                <div key="map-container" ref={mapContainerRef} style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', zIndex: 1 }} />
                 
                 {/* Custom Floating GPS Control */}
                 <button 
