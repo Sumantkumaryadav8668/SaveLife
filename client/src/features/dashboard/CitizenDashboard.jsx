@@ -16,23 +16,45 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
 
-const DEFAULT_COORDS = [12.9716, 77.5946];
-
 const CitizenDashboard = () => {
   const { user, refreshUser } = useAuth();
   const socket = useSocket();
 
-  // Location telemetry states
-  const [currentLocation, setCurrentLocation] = useState(null);
-  const [fetchingLocation, setFetchingLocation] = useState(false);
-  const [locationError, setLocationError] = useState('');
-  const [currentArea, setCurrentArea] = useState('');
+  // Single source of truth location state
+  const [locationState, setLocationState] = useState({
+    latitude: null,
+    longitude: null,
+    accuracy: null,
+    locality: '',
+    city: '',
+    state: '',
+    country: '',
+    loading: true,
+    permissionDenied: false,
+    error: ''
+  });
+
+  // Derived telemetry state variables for compatibility
+  const currentLocation = locationState.latitude && locationState.longitude 
+    ? [locationState.latitude, locationState.longitude] 
+    : null;
+  const fetchingLocation = locationState.loading;
+  const locationError = locationState.error;
+  const locationAccuracy = locationState.accuracy;
+  const locationSource = locationState.latitude ? 'gps' : 'fallback';
+
+  const currentArea = locationState.locality || locationState.city 
+    ? (locationState.locality && locationState.city && locationState.locality.toLowerCase() !== locationState.city.toLowerCase()
+      ? `${locationState.locality}, ${locationState.city}`
+      : locationState.locality || locationState.city)
+    : (locationState.state || locationState.country || '');
 
   // Welcome location notification states
   const [welcomeToast, setWelcomeToast] = useState(null);
   const welcomeShownRef = useRef(false);
   const lastGeocodedCoordsRef = useRef({ lat: null, lng: null });
   const lastGeocodeTimeRef = useRef(0);
+  const geocodeRequestCounterRef = useRef(0);
 
   useEffect(() => {
     if (currentArea && !welcomeShownRef.current) {
@@ -69,41 +91,37 @@ const CitizenDashboard = () => {
       return;
     }
 
+    // Increment request ID to prevent race conditions
+    const requestId = ++geocodeRequestCounterRef.current;
+
     try {
       // Update refs immediately to avoid duplicate parallel requests
       lastGeocodedCoordsRef.current = { lat, lng };
       lastGeocodeTimeRef.current = now;
 
       const res = await sosAPI.reverseGeocode(lat, lng);
+      
+      // If a newer request has started in the meantime, discard this response
+      if (requestId !== geocodeRequestCounterRef.current) {
+        return;
+      }
+
       if (res.success && res.data) {
         const addr = res.data.address || {};
         
-        // Find locality based on user's priority order:
-        // - suburb
-        // - neighbourhood
-        // - city_district
-        // - village
-        // - town
-        // - city
-        let locality = '';
-        if (addr.suburb) locality = addr.suburb;
-        else if (addr.neighbourhood) locality = addr.neighbourhood;
-        else if (addr.city_district) locality = addr.city_district;
-        else if (addr.village) locality = addr.village;
-        else if (addr.town) locality = addr.town;
-        else if (addr.city) locality = addr.city;
+        // Find locality based on prioritized fields
+        const locality = addr.locality || addr.suburb || addr.neighbourhood || addr.city_district || addr.village || addr.town || addr.city || '';
+        const city = addr.city || addr.town || addr.county || '';
+        const state = addr.state || '';
+        const country = addr.country || '';
 
-        // Find the city part (to avoid duplicating locality)
-        const city = addr.city || addr.town || addr.county || addr.state || 'Bengaluru';
-
-        let area = '';
-        if (locality && city && locality.toLowerCase() !== city.toLowerCase()) {
-          area = `${locality}, ${city}`;
-        } else {
-          area = locality || city;
-        }
-
-        setCurrentArea(area);
+        setLocationState(prev => ({
+          ...prev,
+          locality,
+          city,
+          state,
+          country
+        }));
       }
     } catch (err) {
       console.error('Error reverse geocoding:', err);
@@ -115,8 +133,6 @@ const CitizenDashboard = () => {
   const [loadingSOS, setLoadingSOS] = useState(false);
   const [silentSOS, setSilentSOS] = useState(false);
   const [description, setDescription] = useState('');
-  const [locationAccuracy, setLocationAccuracy] = useState(null);
-  const [locationSource, setLocationSource] = useState('fallback');
 
   // SOS countdown states
   const [sosCountdown, setSosCountdown] = useState(null);
@@ -191,15 +207,23 @@ const CitizenDashboard = () => {
     return () => window.removeEventListener('online', handleOnline);
   }, [socket, activeCase]);
 
-  // Live location tracking and socket synchronization
-  useEffect(() => {
+  const trackUserLocation = () => {
+    setLocationState(prev => ({
+      ...prev,
+      loading: true,
+      error: '',
+      permissionDenied: false
+    }));
+
     if (!navigator.geolocation) {
-      setLocationError('Geolocation is not supported by this browser.');
-      setFetchingLocation(false);
-      return;
+      setLocationState(prev => ({
+        ...prev,
+        loading: false,
+        error: 'Geolocation is not supported by this browser.'
+      }));
+      return null;
     }
 
-    setFetchingLocation(true);
     let watchId;
 
     const startWatch = (highAccuracy = true) => {
@@ -208,12 +232,18 @@ const CitizenDashboard = () => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
           const acc = pos.coords.accuracy;
-          setCurrentLocation([lat, lng]);
-          setLocationAccuracy(acc);
-          setLocationSource(highAccuracy ? 'gps' : 'network');
+
+          setLocationState(prev => ({
+            ...prev,
+            latitude: lat,
+            longitude: lng,
+            accuracy: acc,
+            loading: false,
+            permissionDenied: false,
+            error: ''
+          }));
+
           fetchAreaName(lat, lng);
-          setFetchingLocation(false);
-          setLocationError('');
 
           // Emit real-time tracking update if there's an active distress case
           if (activeCase && socket) {
@@ -235,7 +265,6 @@ const CitizenDashboard = () => {
           console.error(`HTML5 Geolocation watch error (HighAccuracy=${highAccuracy}):`, err);
           
           if (highAccuracy && (err.code === err.POSITION_UNAVAILABLE || err.code === err.TIMEOUT)) {
-            // High accuracy failed or timed out — switch to low accuracy
             console.log('High accuracy GPS unavailable. Switching to low accuracy...');
             navigator.geolocation.clearWatch(watchId);
             startWatch(false);
@@ -243,23 +272,35 @@ const CitizenDashboard = () => {
           }
 
           let reason = 'Failed to fetch location.';
+          let isPermissionDenied = false;
+
           if (err.code === err.PERMISSION_DENIED) {
             reason = 'Location permission is required to show your current location.';
+            isPermissionDenied = true;
           } else if (err.code === err.POSITION_UNAVAILABLE) {
             reason = 'Unable to determine your current location. Please check your GPS/location settings.';
           } else if (err.code === err.TIMEOUT) {
             reason = 'Location request timed out. Please try again.';
           }
           
-          setLocationError(reason);
-          setFetchingLocation(false);
+          setLocationState(prev => ({
+            ...prev,
+            loading: false,
+            permissionDenied: isPermissionDenied,
+            error: reason
+          }));
         },
         { enableHighAccuracy: highAccuracy, timeout: 10000, maximumAge: 0 }
       );
     };
 
     startWatch(true);
+    return watchId;
+  };
 
+  // Live location tracking and socket synchronization
+  useEffect(() => {
+    const watchId = trackUserLocation();
     return () => {
       if (watchId) navigator.geolocation.clearWatch(watchId);
     };
@@ -322,11 +363,21 @@ const CitizenDashboard = () => {
   }, [socket, activeCase]);
 
   // Handle map rendering for both safe (current location) and active distress tracking
-  const [currentLat, currentLng] = currentLocation || [null, null];
   useEffect(() => {
-    // If we have an active distress case, center on it. Otherwise center on tracked location
-    const coordinates = activeCase?.location?.coordinates || (currentLocation ? [currentLocation[1], currentLocation[0]] : null);
-    const latLng = coordinates ? [coordinates[1], coordinates[0]] : DEFAULT_COORDS;
+    const coordinates = activeCase?.location?.coordinates || 
+      (locationState.latitude && locationState.longitude ? [locationState.longitude, locationState.latitude] : null);
+
+    if (!coordinates) {
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+        citizenMarkerRef.current = null;
+        accuracyCircleRef.current = null;
+      }
+      return;
+    }
+
+    const latLng = [coordinates[1], coordinates[0]];
 
     if (!mapRef.current && mapContainerRef.current) {
       mapRef.current = L.map(mapContainerRef.current, {
@@ -347,7 +398,21 @@ const CitizenDashboard = () => {
         userHasPannedRef.current = true;
       });
 
-      if (currentLocation || activeCase) {
+      citizenMarkerRef.current = L.marker(latLng, {
+        icon: L.divIcon({
+          className: 'custom-div-icon',
+          html: activeCase 
+            ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
+            : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+          iconSize: [40, 40],
+          iconAnchor: [20, 20],
+        })
+      }).addTo(mapRef.current).bindPopup(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>').openPopup();
+    } else if (mapRef.current) {
+      if (!userHasPannedRef.current) {
+        mapRef.current.setView(latLng);
+      }
+      if (!citizenMarkerRef.current) {
         citizenMarkerRef.current = L.marker(latLng, {
           icon: L.divIcon({
             className: 'custom-div-icon',
@@ -358,50 +423,27 @@ const CitizenDashboard = () => {
             iconAnchor: [20, 20],
           })
         }).addTo(mapRef.current).bindPopup(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>').openPopup();
-      }
-    } else if (mapRef.current) {
-      if (!userHasPannedRef.current) {
-        mapRef.current.setView(latLng);
-      }
-      if (currentLocation || activeCase) {
-        if (!citizenMarkerRef.current) {
-          citizenMarkerRef.current = L.marker(latLng, {
-            icon: L.divIcon({
-              className: 'custom-div-icon',
-              html: activeCase 
-                ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
-                : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
-              iconSize: [40, 40],
-              iconAnchor: [20, 20],
-            })
-          }).addTo(mapRef.current).bindPopup(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>').openPopup();
-        } else {
-          citizenMarkerRef.current.setLatLng(latLng);
-          citizenMarkerRef.current.setPopupContent(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>');
-          
-          // Re-inject icon HTML depending on active/inactive states
-          citizenMarkerRef.current.setIcon(L.divIcon({
-            className: 'custom-div-icon',
-            html: activeCase 
-              ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
-              : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
-            iconSize: [40, 40],
-            iconAnchor: [20, 20],
-          }));
-        }
       } else {
-        if (citizenMarkerRef.current) {
-          citizenMarkerRef.current.remove();
-          citizenMarkerRef.current = null;
-        }
+        citizenMarkerRef.current.setLatLng(latLng);
+        citizenMarkerRef.current.setPopupContent(activeCase ? '<b>Active SOS Distress Point</b>' : '<b>Your Tracked GPS Location</b>');
+        
+        citizenMarkerRef.current.setIcon(L.divIcon({
+          className: 'custom-div-icon',
+          html: activeCase 
+            ? `<div style="background: rgba(239, 68, 68, 0.2); border: 2px solid #EF4444; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; animation: pulse 1.5s infinite;"><div style="background: #EF4444; width: 14px; height: 14px; border-radius: 50%;"></div></div>`
+            : `<div style="background: rgba(99, 102, 241, 0.2); border: 2px solid #6366F1; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;"><div style="background: #6366F1; width: 14px; height: 14px; border-radius: 50%;"></div></div>`,
+          iconSize: [40, 40],
+          iconAnchor: [20, 20],
+        }));
       }
     }
 
     // Update GPS accuracy circle
-    if (locationAccuracy && !activeCase && mapRef.current) {
+    const accuracy = locationState.accuracy;
+    if (accuracy && !activeCase && mapRef.current) {
       if (!accuracyCircleRef.current) {
         accuracyCircleRef.current = L.circle(latLng, {
-          radius: locationAccuracy,
+          radius: accuracy,
           color: '#6366F1',
           fillColor: '#6366F1',
           fillOpacity: 0.08,
@@ -410,7 +452,7 @@ const CitizenDashboard = () => {
         }).addTo(mapRef.current);
       } else {
         accuracyCircleRef.current.setLatLng(latLng);
-        accuracyCircleRef.current.setRadius(locationAccuracy);
+        accuracyCircleRef.current.setRadius(accuracy);
       }
     } else {
       if (accuracyCircleRef.current) {
@@ -448,7 +490,7 @@ const CitizenDashboard = () => {
         responderMarkerRef.current = null;
       }
     }
-  }, [activeCase, currentLat, currentLng, locationAccuracy]);
+  }, [activeCase, locationState.latitude, locationState.longitude, locationState.accuracy]);
 
   // Separate map lifecycle cleanup hook
   useEffect(() => {
@@ -460,107 +502,57 @@ const CitizenDashboard = () => {
     };
   }, []);
 
-  const fetchIPLocation = async (reason) => {
-    try {
-      console.log(`Attempting IP-based geolocation fallback due to: ${reason}`);
-      const response = await fetch('https://ipapi.co/json/');
-      if (response.ok) {
-        const data = await response.json();
-        if (data.latitude && data.longitude) {
-          const lat = data.latitude;
-          const lng = data.longitude;
-          setCurrentLocation([lat, lng]);
-          fetchAreaName(lat, lng);
-          console.log(`IP-based location success (API 1): (${lat}, ${lng})`);
-          setFetchingLocation(false);
-          return;
-        }
-      }
-    } catch (ipErr) {
-      console.error('IP Geolocation fallback 1 failed:', ipErr);
-    }
-
-    try {
-      const response = await fetch('https://ipwho.is/');
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success && data.latitude && data.longitude) {
-          const lat = data.latitude;
-          const lng = data.longitude;
-          setCurrentLocation([lat, lng]);
-          fetchAreaName(lat, lng);
-          console.log(`IP-based location success (API 2): (${lat}, ${lng})`);
-          setFetchingLocation(false);
-          return;
-        }
-      }
-    } catch (ipErr2) {
-      console.error('IP Geolocation fallback 2 failed:', ipErr2);
-    }
-
-    setLocationError(`${reason} Fallback failed. Using default coordinates.`);
-    setCurrentLocation(DEFAULT_COORDS);
-    fetchAreaName(DEFAULT_COORDS[0], DEFAULT_COORDS[1]);
-    setFetchingLocation(false);
-  };
-
   const fetchCurrentLocation = () => {
-    setFetchingLocation(true);
-    setLocationError('');
-    userHasPannedRef.current = false; // Reset pan state to allow recenter
-
-    if (!navigator.geolocation) {
-      fetchIPLocation('Geolocation is not supported by this browser.');
-      return;
-    }
-
-    const queryPosition = (highAccuracy = true) => {
+    userHasPannedRef.current = false;
+    setLocationState(prev => ({ ...prev, loading: true }));
+    
+    if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
           const acc = pos.coords.accuracy;
-          setCurrentLocation([lat, lng]);
-          setLocationAccuracy(acc);
-          fetchAreaName(lat, lng);
-          setFetchingLocation(false);
 
+          setLocationState(prev => ({
+            ...prev,
+            latitude: lat,
+            longitude: lng,
+            accuracy: acc,
+            loading: false,
+            permissionDenied: false,
+            error: ''
+          }));
+
+          fetchAreaName(lat, lng);
+          
           if (mapRef.current) {
             mapRef.current.setView([lat, lng], 15);
           }
-
-          // Emit real-time tracking update if there's an active distress case
-          if (activeCase && socket) {
-            socket.emit('update_location', {
-              userId: user.id,
-              latitude: lat,
-              longitude: lng
-            });
-          }
         },
         (err) => {
-          console.error(`HTML5 Geolocation error (HighAccuracy=${highAccuracy}):`, err);
-          if (highAccuracy && (err.code === err.POSITION_UNAVAILABLE || err.code === err.TIMEOUT)) {
-            console.log('High accuracy getCurrentPosition failed. Retrying with low accuracy...');
-            queryPosition(false);
-            return;
-          }
-
+          console.error('Refresh GPS error:', err);
           let reason = 'Failed to fetch location.';
-          if (err.code === err.PERMISSION_DENIED) {
-            reason = 'Location access is required to display your current location.';
-          } else if (err.code === err.POSITION_UNAVAILABLE) {
-            reason = 'Position unavailable.';
-          } else if (err.code === err.TIMEOUT) {
-            reason = 'Request timed out.';
-          }
-          fetchIPLocation(reason);
-        },
-        { enableHighAccuracy: highAccuracy, timeout: highAccuracy ? 8000 : 5000, maximumAge: 0 }
-      );
-    };
+          let isPermissionDenied = false;
 
-    queryPosition(true);
+          if (err.code === err.PERMISSION_DENIED) {
+            reason = 'Location permission is required to show your current location.';
+            isPermissionDenied = true;
+          } else if (err.code === err.POSITION_UNAVAILABLE) {
+            reason = 'Unable to determine your current location. Please check your GPS/location settings.';
+          } else if (err.code === err.TIMEOUT) {
+            reason = 'Location request timed out. Please try again.';
+          }
+
+          setLocationState(prev => ({
+            ...prev,
+            loading: false,
+            permissionDenied: isPermissionDenied,
+            error: reason
+          }));
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+    }
   };
 
   const handleRecenterMap = () => {
@@ -677,14 +669,22 @@ const CitizenDashboard = () => {
         });
     };
 
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => sendSOS(pos.coords.latitude, pos.coords.longitude),
-        () => sendSOS(DEFAULT_COORDS[0], DEFAULT_COORDS[1]),
-        { enableHighAccuracy: true, timeout: 5000 }
-      );
+    if (locationState.latitude && locationState.longitude) {
+      sendSOS(locationState.latitude, locationState.longitude);
     } else {
-      sendSOS(DEFAULT_COORDS[0], DEFAULT_COORDS[1]);
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => sendSOS(pos.coords.latitude, pos.coords.longitude),
+          (err) => {
+            alert('SOS failed: High-accuracy GPS coordinates are required to request emergency dispatch. Please grant location access in your browser settings.');
+            setLoadingSOS(false);
+          },
+          { enableHighAccuracy: true, timeout: 5000 }
+        );
+      } else {
+        alert('SOS failed: Geolocation is not supported by your browser.');
+        setLoadingSOS(false);
+      }
     }
   };
 
@@ -979,8 +979,8 @@ const CitizenDashboard = () => {
               </div>
               <div style={{ minWidth: 0, flex: 1 }}>
                 <span style={{ display: 'block', fontSize: '9px', color: '#64748B', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Current Area / Locality</span>
-                <span style={{ fontSize: '13px', fontWeight: 600, color: 'white', display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={currentArea || 'Fetching Location...'}>
-                  {fetchingLocation ? 'Pinpointing...' : (currentArea || 'Bengaluru, India')}
+                <span style={{ fontSize: '13px', fontWeight: 600, color: 'white', display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={displayLocality()}>
+                  {displayLocality()}
                 </span>
               </div>
             </div>
@@ -1013,13 +1013,19 @@ const CitizenDashboard = () => {
               <div style={{ minWidth: 0, flex: 1 }}>
                 <span style={{ display: 'block', fontSize: '9px', color: '#64748B', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Exact GPS Coordinates</span>
                 <span style={{ fontSize: '13px', fontWeight: 600, color: 'white', display: 'block', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {fetchingLocation && !currentLocation 
-                    ? 'Loading...' 
-                    : (currentLocation ? `${currentLocation[0].toFixed(5)}°, ${currentLocation[1].toFixed(5)}°` : 'Searching...')}
+                  {locationState.permissionDenied
+                    ? 'Location permission denied'
+                    : locationState.error && !locationState.latitude
+                      ? 'Unable to determine location'
+                      : locationState.loading && !locationState.latitude
+                        ? 'Searching...'
+                        : (locationState.latitude && locationState.longitude 
+                          ? `${locationState.latitude.toFixed(5)}°, ${locationState.longitude.toFixed(5)}°` 
+                          : 'Searching...')}
                 </span>
-                {locationAccuracy !== null && (
+                {locationState.latitude && locationState.accuracy !== null && (
                   <span style={{ display: 'block', fontSize: '9px', color: '#06B6D4', marginTop: '2px', fontWeight: 600 }}>
-                    Accuracy: &plusmn;{Math.round(locationAccuracy)}m ({locationSource.toUpperCase()})
+                    Accuracy: &plusmn;{Math.round(locationState.accuracy)}m (GPS)
                   </span>
                 )}
               </div>
@@ -1055,36 +1061,51 @@ const CitizenDashboard = () => {
             </div>
           )}
 
-          {/* Leaflet GPS map is always rendered */}
+          {/* Leaflet GPS map is only initialized and rendered when valid coordinates are available */}
           <div style={{ position: 'relative' }}>
-            <div ref={mapContainerRef} style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', zIndex: 1 }} />
-            
-            {/* Custom Floating GPS Control */}
-            <button 
-              onClick={handleRecenterMap}
-              style={{
-                position: 'absolute',
-                top: '80px',
-                left: '10px',
-                zIndex: 999,
-                width: '34px',
-                height: '34px',
-                background: 'rgba(15, 23, 42, 0.9)',
-                border: '1px solid rgba(255, 255, 255, 0.1)',
-                borderRadius: '4px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: '#f8fafc',
-                cursor: 'pointer',
-                boxShadow: '0 1px 5px rgba(0,0,0,0.65)',
-                transition: 'all 0.2s',
-              }}
-              className="hover:bg-white/10"
-              title="My Location"
-            >
-              <Navigation size={16} style={{ transform: 'rotate(45deg)' }} />
-            </button>
+            {!(locationState.latitude && locationState.longitude) && !activeCase?.location?.coordinates ? (
+              <div style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(15, 23, 42, 0.4)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '24px', textAlign: 'center' }}>
+                <MapPin size={40} color="#6366F1" style={{ opacity: 0.6, animation: 'pulse 2s infinite' }} />
+                <span style={{ fontSize: '14px', color: '#94A3B8', fontWeight: 500 }}>
+                  {locationState.permissionDenied 
+                    ? 'Location permission denied. Please enable GPS access in your browser settings.' 
+                    : locationState.error 
+                      ? 'Unable to determine GPS location. Please check your location settings.'
+                      : 'Acquiring high-accuracy GPS coordinates...'}
+                </span>
+              </div>
+            ) : (
+              <>
+                <div ref={mapContainerRef} style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', overflow: 'hidden', zIndex: 1 }} />
+                
+                {/* Custom Floating GPS Control */}
+                <button 
+                  onClick={handleRecenterMap}
+                  style={{
+                    position: 'absolute',
+                    top: '80px',
+                    left: '10px',
+                    zIndex: 999,
+                    width: '34px',
+                    height: '34px',
+                    background: 'rgba(15, 23, 42, 0.9)',
+                    border: '1px solid rgba(255, 255, 255, 0.1)',
+                    borderRadius: '4px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: '#f8fafc',
+                    cursor: 'pointer',
+                    boxShadow: '0 1px 5px rgba(0,0,0,0.65)',
+                    transition: 'all 0.2s',
+                  }}
+                  className="hover:bg-white/10"
+                  title="My Location"
+                >
+                  <Navigation size={16} style={{ transform: 'rotate(45deg)' }} />
+                </button>
+              </>
+            )}
           </div>
 
           {/* Context controls based on distress states */}
