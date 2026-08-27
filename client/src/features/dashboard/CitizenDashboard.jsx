@@ -8,6 +8,8 @@ import 'leaflet/dist/leaflet.css';
 import { formatDate } from '../../lib/utils.js';
 import { queueLocation } from '../../utils/offlineQueue.js';
 
+import { useDeviceLocation } from '../../hooks/useDeviceLocation.js';
+
 // Fix Leaflet default marker icon paths in bundler build
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -20,57 +22,58 @@ const CitizenDashboard = () => {
   const { user, refreshUser } = useAuth();
   const socket = useSocket();
 
-  // Single source of truth location state
-  const [locationState, setLocationState] = useState({
-    latitude: null,
-    longitude: null,
-    accuracy: null,
-    locality: '',
-    city: '',
-    state: '',
-    country: '',
-    loading: true,
-    permissionDenied: false,
-    error: ''
-  });
+  // SOS state - declared early for use in useDeviceLocation
+  const [activeCase, setActiveCase] = useState(null);
+
+  // Geolocation and permission tracking unified hook
+  const {
+    latitude,
+    longitude,
+    accuracy,
+    locality,
+    city,
+    state,
+    country,
+    permissionState,
+    loading: fetchingLocation,
+    error: locationError,
+    refreshLocation,
+    startWatching,
+    stopWatching
+  } = useDeviceLocation(activeCase, socket, user?.id, user?.role);
 
   // Derived telemetry state variables for compatibility
-  const currentLocation = locationState.latitude && locationState.longitude 
-    ? [locationState.latitude, locationState.longitude] 
-    : null;
-  const fetchingLocation = locationState.loading;
-  const locationError = locationState.error;
-  const locationAccuracy = locationState.accuracy;
-  const locationSource = locationState.latitude ? 'gps' : 'fallback';
-
-  const currentArea = locationState.locality || locationState.city 
-    ? (locationState.locality && locationState.city && locationState.locality.toLowerCase() !== locationState.city.toLowerCase()
-      ? `${locationState.locality}, ${locationState.city}`
-      : locationState.locality || locationState.city)
-    : (locationState.state || locationState.country || '');
+  const currentLocation = latitude && longitude ? [latitude, longitude] : null;
+  const locationAccuracy = accuracy;
+  const locationSource = latitude ? 'gps' : 'fallback';
+  const currentArea = locality || city 
+    ? (locality && city && locality.toLowerCase() !== city.toLowerCase()
+      ? `${locality}, ${city}`
+      : locality || city)
+    : (state || country || '');
 
   // Construct a formatted locality/city area name dynamically from the state
   const displayLocality = () => {
-    if (locationState.loading && !locationState.locality && !locationState.city) {
+    if (fetchingLocation && !locality && !city) {
       return 'Pinpointing...';
     }
-    if (locationState.permissionDenied) {
+    if (permissionState === 'denied') {
       return 'Location permission denied';
     }
-    if (locationState.error && !locationState.latitude) {
+    if (locationError && !latitude) {
       return 'Unable to determine location';
     }
     
     const parts = [];
-    if (locationState.locality) parts.push(locationState.locality);
-    if (locationState.city) parts.push(locationState.city);
-    else if (locationState.state) parts.push(locationState.state);
+    if (locality) parts.push(locality);
+    if (city) parts.push(city);
+    else if (state) parts.push(state);
     
     if (parts.length > 0) {
       return parts.join(', ');
     }
     
-    if (locationState.country) return locationState.country;
+    if (country) return country;
     
     return 'Fetching Location...';
   };
@@ -78,11 +81,6 @@ const CitizenDashboard = () => {
   // Welcome location notification states
   const [welcomeToast, setWelcomeToast] = useState(null);
   const welcomeShownRef = useRef(false);
-  const lastGeocodedCoordsRef = useRef({ lat: null, lng: null });
-  const lastGeocodeTimeRef = useRef(0);
-  const geocodeRequestCounterRef = useRef(0);
-  const watchIdRef = useRef(null);
-  const permissionStatusRef = useRef(null);
 
   useEffect(() => {
     if (currentArea && !welcomeShownRef.current) {
@@ -101,63 +99,9 @@ const CitizenDashboard = () => {
     }
   }, [currentArea, currentLocation, user?.name]);
 
-  const fetchAreaName = async (lat, lng) => {
-    const now = Date.now();
-    const lastTime = lastGeocodeTimeRef.current;
-    const lastCoords = lastGeocodedCoordsRef.current;
 
-    // Check if coordinates changed by a meaningful distance (approx 0.0005 degrees ~ 50 meters)
-    const hasMovedSignificantly = 
-      lastCoords.lat === null ||
-      lastCoords.lng === null ||
-      Math.abs(lat - lastCoords.lat) > 0.0005 ||
-      Math.abs(lng - lastCoords.lng) > 0.0005;
-
-    const isCooldownElapsed = (now - lastTime) > 15000; // 15 seconds cooldown
-
-    if (!hasMovedSignificantly && !isCooldownElapsed) {
-      return;
-    }
-
-    // Increment request ID to prevent race conditions
-    const requestId = ++geocodeRequestCounterRef.current;
-
-    try {
-      // Update refs immediately to avoid duplicate parallel requests
-      lastGeocodedCoordsRef.current = { lat, lng };
-      lastGeocodeTimeRef.current = now;
-
-      const res = await sosAPI.reverseGeocode(lat, lng);
-      
-      // If a newer request has started in the meantime, discard this response
-      if (requestId !== geocodeRequestCounterRef.current) {
-        return;
-      }
-
-      if (res.success && res.data) {
-        const addr = res.data.address || {};
-        
-        // Find locality based on prioritized fields
-        const locality = addr.locality || addr.suburb || addr.neighbourhood || addr.city_district || addr.village || addr.town || addr.city || '';
-        const city = addr.city || addr.town || addr.county || '';
-        const state = addr.state || '';
-        const country = addr.country || '';
-
-        setLocationState(prev => ({
-          ...prev,
-          locality,
-          city,
-          state,
-          country
-        }));
-      }
-    } catch (err) {
-      console.error('Error reverse geocoding:', err);
-    }
-  };
 
   // SOS state
-  const [activeCase, setActiveCase] = useState(null);
   const [loadingSOS, setLoadingSOS] = useState(false);
   const [silentSOS, setSilentSOS] = useState(false);
   const [description, setDescription] = useState('');
@@ -235,194 +179,7 @@ const CitizenDashboard = () => {
     return () => window.removeEventListener('online', handleOnline);
   }, [socket, activeCase]);
 
-  const clearWatcher = () => {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-  };
 
-  const startWatchLoop = (highAccuracy = true) => {
-    clearWatcher();
-
-    if (!navigator.geolocation) {
-      setLocationState(prev => ({
-        ...prev,
-        loading: false,
-        error: 'Geolocation is not supported by this browser.'
-      }));
-      return null;
-    }
-
-    setLocationState(prev => ({
-      ...prev,
-      loading: true,
-      error: '',
-      permissionDenied: false
-    }));
-
-    try {
-      const watchId = navigator.geolocation.watchPosition(
-        (pos) => {
-          const lat = pos.coords.latitude;
-          const lng = pos.coords.longitude;
-          const acc = pos.coords.accuracy;
-
-          setLocationState(prev => ({
-            ...prev,
-            latitude: lat,
-            longitude: lng,
-            accuracy: acc,
-            loading: false,
-            permissionDenied: false,
-            error: ''
-          }));
-
-          fetchAreaName(lat, lng);
-
-          // Emit real-time tracking update if there's an active distress case
-          if (activeCase && socket) {
-            socket.emit('update_location', {
-              userId: user.id,
-              role: user.role,
-              latitude: lat,
-              longitude: lng,
-              sosId: activeCase._id
-            });
-          }
-
-          // If offline, queue the coordinate for later sync
-          if (!navigator.onLine) {
-            queueLocation(lat, lng);
-          }
-        },
-        (err) => {
-          console.error(`HTML5 Geolocation watch error (HighAccuracy=${highAccuracy}):`, err);
-          
-          // Stop watching immediately on error
-          clearWatcher();
-
-          let reason = 'Failed to fetch location.';
-          let isPermissionDenied = false;
-
-          if (err.code === err.PERMISSION_DENIED || err.code === 1) {
-            reason = 'Location permission is blocked for this site. Enable Location permission in your browser Site Settings, then click Refresh GPS.';
-            isPermissionDenied = true;
-          } else if (err.code === err.POSITION_UNAVAILABLE) {
-            reason = 'Unable to determine your current location. Please check your GPS/location settings.';
-          } else if (err.code === err.TIMEOUT) {
-            reason = 'Location request timed out. Please try again.';
-          }
-          
-          setLocationState(prev => ({
-            ...prev,
-            loading: false,
-            permissionDenied: isPermissionDenied,
-            error: reason
-          }));
-        },
-        { enableHighAccuracy: highAccuracy, timeout: 15000, maximumAge: 0 }
-      );
-
-      watchIdRef.current = watchId;
-      return watchId;
-    } catch (e) {
-      console.error('Error starting watchPosition:', e);
-      setLocationState(prev => ({
-        ...prev,
-        loading: false,
-        error: e.message
-      }));
-      return null;
-    }
-  };
-
-  const handlePermissionChange = (state) => {
-    if (state === 'granted') {
-      setLocationState(prev => ({
-        ...prev,
-        permissionDenied: false,
-        error: '',
-        loading: true
-      }));
-      startWatchLoop(true);
-    } else if (state === 'denied') {
-      clearWatcher();
-      setLocationState(prev => ({
-        ...prev,
-        latitude: null,
-        longitude: null,
-        accuracy: null,
-        loading: false,
-        permissionDenied: true,
-        error: 'Location permission is blocked for this site. Enable Location permission in your browser Site Settings, then click Refresh GPS.'
-      }));
-    } else {
-      clearWatcher();
-      setLocationState(prev => ({
-        ...prev,
-        latitude: null,
-        longitude: null,
-        accuracy: null,
-        loading: false,
-        permissionDenied: false,
-        error: ''
-      }));
-    }
-  };
-
-  const handlePermissionState = async (state, forceRequest) => {
-    if (state === 'granted') {
-      return startWatchLoop(true);
-    } else if (state === 'denied') {
-      clearWatcher();
-      setLocationState(prev => ({
-        ...prev,
-        latitude: null,
-        longitude: null,
-        accuracy: null,
-        loading: false,
-        permissionDenied: true,
-        error: 'Location permission is blocked for this site. Enable Location permission in your browser Site Settings, then click Refresh GPS.'
-      }));
-      return null;
-    } else {
-      clearWatcher();
-      return startWatchLoop(true);
-    }
-  };
-
-  const trackUserLocation = async (forceRequest = false) => {
-    if (navigator.permissions && navigator.permissions.query) {
-      try {
-        const permissionStatus = await navigator.permissions.query({ name: 'geolocation' });
-        permissionStatusRef.current = permissionStatus;
-
-        // Listen to changes in permission
-        permissionStatus.onchange = () => {
-          handlePermissionChange(permissionStatus.state);
-        };
-
-        return await handlePermissionState(permissionStatus.state, forceRequest);
-      } catch (err) {
-        console.error('Error querying geolocation permission:', err);
-        return startWatchLoop(forceRequest);
-      }
-    } else {
-      return startWatchLoop(forceRequest);
-    }
-  };
-
-  // Live location tracking and socket synchronization
-  useEffect(() => {
-    trackUserLocation();
-    return () => {
-      clearWatcher();
-      if (permissionStatusRef.current) {
-        permissionStatusRef.current.onchange = null;
-      }
-    };
-  }, [activeCase, socket, user.id]);
 
   // Emit join case room on activeCase load
   useEffect(() => {
@@ -483,7 +240,7 @@ const CitizenDashboard = () => {
   // Handle map rendering for both safe (current location) and active distress tracking
   useEffect(() => {
     const coordinates = activeCase?.location?.coordinates || 
-      (locationState.latitude && locationState.longitude ? [locationState.longitude, locationState.latitude] : null);
+      (latitude && longitude ? [longitude, latitude] : null);
 
     if (!coordinates) {
       if (mapRef.current) {
@@ -567,7 +324,6 @@ const CitizenDashboard = () => {
     }
 
     // Update GPS accuracy circle
-    const accuracy = locationState.accuracy;
     if (accuracy && !activeCase && mapRef.current) {
       if (!accuracyCircleRef.current) {
         accuracyCircleRef.current = L.circle(latLng, {
@@ -618,7 +374,7 @@ const CitizenDashboard = () => {
         responderMarkerRef.current = null;
       }
     }
-  }, [activeCase, locationState.latitude, locationState.longitude, locationState.accuracy]);
+  }, [activeCase, latitude, longitude, accuracy]);
 
   // Separate map lifecycle cleanup hook
   useEffect(() => {
@@ -637,88 +393,12 @@ const CitizenDashboard = () => {
 
   const fetchCurrentLocation = async () => {
     userHasPannedRef.current = false;
-    
-    // First, check permission state if possible
-    if (navigator.permissions && navigator.permissions.query) {
-      try {
-        const permissionStatus = await navigator.permissions.query({ name: 'geolocation' });
-        if (permissionStatus.state === 'denied') {
-          clearWatcher();
-          setLocationState(prev => ({
-            ...prev,
-            latitude: null,
-            longitude: null,
-            accuracy: null,
-            loading: false,
-            permissionDenied: true,
-            error: 'Location permission is blocked for this site. Enable Location permission in your browser Site Settings, then click Refresh GPS.'
-          }));
-          return;
-        }
-      } catch (err) {
-        console.error('Error checking permission before refresh:', err);
-      }
-    }
-
-    setLocationState(prev => ({ ...prev, loading: true, error: '', permissionDenied: false }));
-    
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const lat = pos.coords.latitude;
-          const lng = pos.coords.longitude;
-          const acc = pos.coords.accuracy;
-
-          setLocationState(prev => ({
-            ...prev,
-            latitude: lat,
-            longitude: lng,
-            accuracy: acc,
-            loading: false,
-            permissionDenied: false,
-            error: ''
-          }));
-
-          fetchAreaName(lat, lng);
-          
-          if (mapRef.current) {
-            mapRef.current.setView([lat, lng], 15);
-          }
-
-          // Restart high-accuracy watch loop
-          startWatchLoop(true);
-        },
-        (err) => {
-          console.error('Refresh GPS getCurrentPosition error:', err);
-          clearWatcher();
-
-          let reason = 'Failed to fetch location.';
-          let isPermissionDenied = false;
-
-          if (err.code === err.PERMISSION_DENIED || err.code === 1) {
-            reason = 'Location permission is blocked for this site. Enable Location permission in your browser Site Settings, then click Refresh GPS.';
-            isPermissionDenied = true;
-          } else if (err.code === err.POSITION_UNAVAILABLE) {
-            reason = 'Unable to determine your current location. Please check your GPS/location settings.';
-          } else if (err.code === err.TIMEOUT) {
-            reason = 'Location request timed out. Please try again.';
-          }
-
-          setLocationState(prev => ({
-            ...prev,
-            loading: false,
-            permissionDenied: isPermissionDenied,
-            error: reason
-          }));
-        },
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-      );
-    }
+    await refreshLocation();
   };
 
   const handleRecenterMap = () => {
     userHasPannedRef.current = false;
-    fetchCurrentLocation();
+    refreshLocation();
   };
 
   const updateMapResponderLocation = (loc) => {
@@ -830,8 +510,8 @@ const CitizenDashboard = () => {
         });
     };
 
-    if (locationState.latitude && locationState.longitude) {
-      sendSOS(locationState.latitude, locationState.longitude);
+    if (latitude && longitude) {
+      sendSOS(latitude, longitude);
     } else {
       if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition(
@@ -1174,19 +854,19 @@ const CitizenDashboard = () => {
               <div style={{ minWidth: 0, flex: 1 }}>
                 <span style={{ display: 'block', fontSize: '9px', color: '#64748B', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Exact GPS Coordinates</span>
                 <span style={{ fontSize: '13px', fontWeight: 600, color: 'white', display: 'block', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {locationState.permissionDenied
+                  {permissionState === 'denied'
                     ? 'Location permission denied'
-                    : locationState.error && !locationState.latitude
+                    : locationError && !latitude
                       ? 'Unable to determine location'
-                      : locationState.loading && !locationState.latitude
+                      : fetchingLocation && !latitude
                         ? 'Searching...'
-                        : (locationState.latitude && locationState.longitude 
-                          ? `${locationState.latitude.toFixed(5)}°, ${locationState.longitude.toFixed(5)}°` 
+                        : (latitude && longitude 
+                          ? `${latitude.toFixed(5)}°, ${longitude.toFixed(5)}°` 
                           : 'Searching...')}
                 </span>
-                {locationState.latitude && locationState.accuracy !== null && (
+                {latitude && accuracy !== null && (
                   <span style={{ display: 'block', fontSize: '9px', color: '#06B6D4', marginTop: '2px', fontWeight: 600 }}>
-                    Accuracy: &plusmn;{Math.round(locationState.accuracy)}m (GPS)
+                    Accuracy: &plusmn;{Math.round(accuracy)}m (GPS)
                   </span>
                 )}
               </div>
@@ -1221,7 +901,7 @@ const CitizenDashboard = () => {
               <div style={{ fontWeight: 700, marginBottom: '6px', fontSize: '14px', display: 'flex', alignItems: 'center', gap: '8px' }}>
                 ⚠️ Location Permission Blocked
               </div>
-              {locationState.permissionDenied ? (
+              {permissionState === 'denied' ? (
                 <div>
                   <p style={{ marginBottom: '8px', fontWeight: 600 }}>Location permission is blocked for this site. To enable it:</p>
                   <ol style={{ paddingLeft: '20px', listStyleType: 'decimal', display: 'flex', flexDirection: 'column', gap: '4px', margin: '4px 0' }}>
@@ -1240,13 +920,13 @@ const CitizenDashboard = () => {
 
           {/* Leaflet GPS map is only initialized and rendered when valid coordinates are available */}
           <div style={{ position: 'relative' }}>
-            {!(locationState.latitude && locationState.longitude) && !activeCase?.location?.coordinates ? (
+            {!(latitude && longitude) && !activeCase?.location?.coordinates ? (
               <div key="map-placeholder" style={{ height: '320px', borderRadius: '16px', border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(15, 23, 42, 0.4)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '24px', textAlign: 'center' }}>
                 <MapPin size={40} color="#6366F1" style={{ opacity: 0.6, animation: 'pulse 2s infinite' }} />
                 <span style={{ fontSize: '14px', color: '#94A3B8', fontWeight: 500 }}>
-                  {locationState.permissionDenied 
+                  {permissionState === 'denied' 
                     ? 'Location permission denied. Please enable GPS access in your browser settings.' 
-                    : locationState.error 
+                    : locationError 
                       ? 'Unable to determine GPS location. Please check your location settings.'
                       : 'Acquiring high-accuracy GPS coordinates...'}
                 </span>
