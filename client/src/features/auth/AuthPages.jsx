@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth.js';
 import { authAPI } from '../../services/api.service.js';
@@ -26,13 +26,19 @@ const handleRoleMap = (roleName) => {
 
 // ── Login Page ──
 export const LoginPage = () => {
-  const { login } = useAuth();
+  const { user, login } = useAuth();
   const navigate = useNavigate();
   const [form, setForm] = useState({ email: '', password: '' });
   const [errors, setErrors] = useState({});
   const [authError, setAuthError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPw, setShowPw] = useState(false);
+
+  useEffect(() => {
+    if (user) {
+      navigate('/dashboard', { replace: true });
+    }
+  }, [user, navigate]);
 
   const validate = () => {
     const e = {};
@@ -126,6 +132,7 @@ export const LoginPage = () => {
 
 // ── Register Page ──
 export const RegisterPage = () => {
+  const { user } = useAuth();
   const navigate = useNavigate();
   const [form, setForm] = useState({ name: '', email: '', password: '', phone: '', role: 'user' });
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -136,6 +143,12 @@ export const RegisterPage = () => {
   const [showPw, setShowPw] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [success, setSuccess] = useState(false);
+
+  useEffect(() => {
+    if (user) {
+      navigate('/dashboard', { replace: true });
+    }
+  }, [user, navigate]);
 
   const validate = () => {
     const e = {};
