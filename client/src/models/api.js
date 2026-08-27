@@ -52,6 +52,7 @@ export const sosAPI = {
   accept: (id, eta) => apiClient.post(`/sos/accept/${id}`, { eta }),
   resolve: (id, rating, comment) => apiClient.post(`/sos/resolve/${id}`, { rating, comment }),
   flagAbuse: (id, comment) => apiClient.post(`/sos/abuse/${id}`, { comment }),
+  reverseGeocode: (lat, lng) => apiClient.get(`/sos/reverse-geocode?lat=${lat}&lng=${lng}`),
 };
 
 export const hospitalAPI = {

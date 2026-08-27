@@ -106,3 +106,52 @@ export const getHistory = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+const geocodeCache = new Map();
+
+export const reverseGeocode = async (req, res) => {
+  const { lat, lng } = req.query;
+  if (!lat || !lng) {
+    return res.status(400).json({ success: false, message: 'Latitude and longitude are required' });
+  }
+
+  // Create a cache key by rounding coordinates to 4 decimal places (~11m accuracy)
+  const latKey = parseFloat(lat).toFixed(4);
+  const lngKey = parseFloat(lng).toFixed(4);
+  const cacheKey = `${latKey},${lngKey}`;
+
+  if (geocodeCache.has(cacheKey)) {
+    return res.json({ success: true, data: geocodeCache.get(cacheKey) });
+  }
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`;
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'LifeSaveApp/1.0 (contact@lifesave.example.com)',
+        'Accept-Language': 'en'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Nominatim API error: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+
+    // Cache the result
+    geocodeCache.set(cacheKey, data);
+
+    // Bound the cache size to avoid memory leaks
+    if (geocodeCache.size > 1000) {
+      const firstKey = geocodeCache.keys().next().value;
+      geocodeCache.delete(firstKey);
+    }
+
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Error in reverseGeocode proxy:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+

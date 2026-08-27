@@ -1,11 +1,12 @@
 import express from 'express';
 const router = express.Router();
-import { triggerSOS, acceptSOS, resolveSOS, flagFalseAlarm, getActiveCases, getHistory } from './sos.controller.js';
+import { triggerSOS, acceptSOS, resolveSOS, flagFalseAlarm, getActiveCases, getHistory, reverseGeocode } from './sos.controller.js';
 import { protect, restrictTo } from '../../middleware/auth.middleware.js';
 
 router.post('/trigger', protect, triggerSOS);
 router.get('/active', protect, getActiveCases);
 router.get('/history', protect, getHistory);
+router.get('/reverse-geocode', protect, reverseGeocode);
 
 // Specific responder operations
 router.post('/:id/accept', protect, restrictTo('hospital_admin', 'police', 'rescue_person', 'system_admin'), acceptSOS);

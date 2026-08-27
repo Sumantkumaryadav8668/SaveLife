@@ -31,6 +31,8 @@ const CitizenDashboard = () => {
   // Welcome location notification states
   const [welcomeToast, setWelcomeToast] = useState(null);
   const welcomeShownRef = useRef(false);
+  const lastGeocodedCoordsRef = useRef({ lat: null, lng: null });
+  const lastGeocodeTimeRef = useRef(0);
 
   useEffect(() => {
     if (currentArea && !welcomeShownRef.current) {
@@ -50,11 +52,31 @@ const CitizenDashboard = () => {
   }, [currentArea, currentLocation, user?.name]);
 
   const fetchAreaName = async (lat, lng) => {
+    const now = Date.now();
+    const lastTime = lastGeocodeTimeRef.current;
+    const lastCoords = lastGeocodedCoordsRef.current;
+
+    // Check if coordinates changed by a meaningful distance (approx 0.0005 degrees ~ 50 meters)
+    const hasMovedSignificantly = 
+      lastCoords.lat === null ||
+      lastCoords.lng === null ||
+      Math.abs(lat - lastCoords.lat) > 0.0005 ||
+      Math.abs(lng - lastCoords.lng) > 0.0005;
+
+    const isCooldownElapsed = (now - lastTime) > 15000; // 15 seconds cooldown
+
+    if (!hasMovedSignificantly && !isCooldownElapsed) {
+      return;
+    }
+
     try {
-      const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`);
-      if (response.ok) {
-        const data = await response.json();
-        const addr = data.address || {};
+      // Update refs immediately to avoid duplicate parallel requests
+      lastGeocodedCoordsRef.current = { lat, lng };
+      lastGeocodeTimeRef.current = now;
+
+      const res = await sosAPI.reverseGeocode(lat, lng);
+      if (res.success && res.data) {
+        const addr = res.data.address || {};
         
         // Find locality based on user's priority order:
         // - suburb
